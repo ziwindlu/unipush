@@ -1,0 +1,43 @@
+# unipush 配置样例。
+#
+# ${VAR} 会在启动时从环境变量展开；建议把真实密钥写进 .env（不会入库），
+# 仓库里只保留 .env.example 占位。
+server:
+  # 只监听本机，公网暴露请放到反向代理后并开启鉴权。
+  addr: "127.0.0.1:8080"
+  read_timeout: 15s
+  write_timeout: 15s
+  idle_timeout: 60s
+  shutdown_timeout: 10s
+  max_body_bytes: 1048576
+
+auth:
+  # 多个 token 用 YAML 列表；例如 [${UNIPUSH_AUTH_TOKEN}, ${UNIPUSH_AUTH_TOKEN_2}]
+  tokens:
+    - ${UNIPUSH_AUTH_TOKEN}
+
+database:
+  # 数据目录不入库；SQLite 会同时产生 -wal / -shm 文件。
+  path: "./data/unipush.db"
+
+dispatch:
+  workers: 4
+  poll_interval: 1s
+  # 认领后允许的最长发送时间；超时未回写视为进程崩溃，可被重新认领。
+  lease: 60s
+  max_attempts: 8
+  base_backoff: 2s
+  max_backoff: 5m
+  request_timeout: 15s
+
+channels:
+  bark:
+    enabled: true
+    server_url: "https://api.day.app"
+    device_key: ${BARK_DEVICE_KEY}
+    group: "unipush"
+    sound: ""
+  dingtalk:
+    enabled: true
+    webhook: ${DINGTALK_WEBHOOK}
+    secret: ${DINGTALK_SECRET}
