@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/ziwindlu/unipush/internal/channel"
 	"github.com/ziwindlu/unipush/internal/dispatch"
 	"github.com/ziwindlu/unipush/internal/model"
+	"github.com/ziwindlu/unipush/internal/routing"
 	"github.com/ziwindlu/unipush/internal/store"
 )
 
@@ -79,11 +81,16 @@ type harness struct {
 
 func startHarness(t *testing.T, path string, senders channel.Set, cfg dispatch.Config) *harness {
 	t.Helper()
+	return startRoutedHarness(t, path, senders, nil, cfg)
+}
+
+func startRoutedHarness(t *testing.T, path string, senders channel.Set, router *routing.Router, cfg dispatch.Config) *harness {
+	t.Helper()
 	st, err := store.Open(context.Background(), path)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	dsp := dispatch.New(st, senders, cfg, discardLogger())
+	dsp := dispatch.New(st, senders, router, cfg, discardLogger())
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &harness{st: st, disp: dsp, cancel: cancel, done: make(chan struct{})}
 	go func() {
@@ -310,7 +317,7 @@ func TestRestartRecoversInFlightDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	dsp1 := dispatch.New(st1, channel.Set{"bark": &fakeSender{name: "bark"}}, fastConfig(), discardLogger())
+	dsp1 := dispatch.New(st1, channel.Set{"bark": &fakeSender{name: "bark"}}, nil, fastConfig(), discardLogger())
 	msg := newMessage("bark")
 	if _, err := dsp1.Enqueue(context.Background(), msg); err != nil {
 		t.Fatalf("Enqueue: %v", err)
@@ -344,5 +351,146 @@ func TestEnqueueWithoutChannels(t *testing.T) {
 	h := startHarness(t, filepath.Join(t.TempDir(), "unipush.db"), channel.Set{}, fastConfig())
 	if _, err := h.disp.Enqueue(context.Background(), newMessage()); !errors.Is(err, dispatch.ErrNoChannels) {
 		t.Fatalf("期望 ErrNoChannels，实际 %v", err)
+	}
+}
+
+// testRouter 构造 M2 的路由表：nas 告警只发手机，ci 构建信息只发钉钉，其余全渠道。
+func testRouter(t *testing.T, enabled ...string) *routing.Router {
+	t.Helper()
+	if enabled == nil {
+		enabled = []string{"bark", "dingtalk"}
+	}
+	router, err := routing.New(routing.Config{
+		Groups: map[string][]string{
+			"phone": {"bark"},
+			"team":  {"dingtalk"},
+			"all":   {"bark", "dingtalk"},
+		},
+		Default: []string{"all"},
+		Rules: []routing.Rule{
+			{Name: "nas-alerts", Sources: []string{"nas-*"}, Levels: []string{model.LevelError}, Groups: []string{"phone"}},
+			{Name: "ci-build", Sources: []string{"ci"}, Levels: []string{model.LevelInfo}, Groups: []string{"team"}},
+		},
+	}, routing.Options{
+		SupportedChannels: []string{"bark", "dingtalk"},
+		EnabledChannels:   enabled,
+	})
+	if err != nil {
+		t.Fatalf("routing.New: %v", err)
+	}
+	return router
+}
+
+func routedMessage(source, level string, targets ...string) *model.Message {
+	return &model.Message{
+		ID:      model.NewID("msg_"),
+		Title:   "测试",
+		Body:    "正文",
+		Level:   level,
+		Source:  source,
+		Targets: targets,
+	}
+}
+
+func TestRoutingSelectsChannelsBySource(t *testing.T) {
+	bark := &fakeSender{name: "bark"}
+	dingtalk := &fakeSender{name: "dingtalk"}
+	h := startRoutedHarness(t, filepath.Join(t.TempDir(), "unipush.db"),
+		channel.Set{"bark": bark, "dingtalk": dingtalk}, testRouter(t), fastConfig())
+
+	nas := routedMessage("nas-monitor", model.LevelError)
+	deliveries, err := h.disp.Enqueue(context.Background(), nas)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if len(deliveries) != 1 || deliveries[0].Channel != "bark" {
+		t.Fatalf("nas 告警应只投 bark，实际 %+v", deliveries)
+	}
+	if deliveries[0].Rule != "nas-alerts" || strings.Join(deliveries[0].Groups, ",") != "phone" {
+		t.Errorf("投递记录应带命中规则与组: rule=%q groups=%v", deliveries[0].Rule, deliveries[0].Groups)
+	}
+	waitFor(t, 5*time.Second, "bark 投递成功", func() bool {
+		d := deliveriesByChannel(t, h.st, nas.ID)["bark"]
+		return d != nil && d.Status == model.DeliverySucceeded
+	})
+
+	stored, err := h.st.GetMessage(context.Background(), nas.ID)
+	if err != nil {
+		t.Fatalf("GetMessage: %v", err)
+	}
+	if stored.Route == nil {
+		t.Fatal("消息没有保存路由解析结果")
+	}
+	if stored.Route.Mode != routing.ModeRule || stored.Route.Rule != "nas-alerts" {
+		t.Errorf("route = %+v, 期望命中 nas-alerts", stored.Route)
+	}
+	if strings.Join(stored.Route.Groups, ",") != "phone" || strings.Join(stored.Route.Channels, ",") != "bark" {
+		t.Errorf("route 目标组/渠道错误: %+v", stored.Route)
+	}
+	if stored.Route.Rule != deliveries[0].Rule {
+		t.Errorf("消息与投递记录的规则不一致: %q vs %q", stored.Route.Rule, deliveries[0].Rule)
+	}
+
+	ci := routedMessage("ci", model.LevelInfo)
+	deliveries, err = h.disp.Enqueue(context.Background(), ci)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if len(deliveries) != 1 || deliveries[0].Channel != "dingtalk" {
+		t.Fatalf("ci 信息应只投 dingtalk，实际 %+v", deliveries)
+	}
+	if deliveries[0].Rule != "ci-build" || strings.Join(deliveries[0].Groups, ",") != "team" {
+		t.Errorf("投递记录应带命中规则与组: rule=%q groups=%v", deliveries[0].Rule, deliveries[0].Groups)
+	}
+}
+
+func TestRoutingExplicitTargetsOverrideRules(t *testing.T) {
+	bark := &fakeSender{name: "bark"}
+	dingtalk := &fakeSender{name: "dingtalk"}
+	h := startRoutedHarness(t, filepath.Join(t.TempDir(), "unipush.db"),
+		channel.Set{"bark": bark, "dingtalk": dingtalk}, testRouter(t), fastConfig())
+
+	// 来源规则本该投 phone，显式 targets 指向 team 后覆盖规则。
+	msg := routedMessage("nas-monitor", model.LevelError, "team")
+	deliveries, err := h.disp.Enqueue(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if len(deliveries) != 1 || deliveries[0].Channel != "dingtalk" {
+		t.Fatalf("显式 targets 应覆盖规则，实际 %+v", deliveries)
+	}
+	if msg.Route == nil || msg.Route.Mode != routing.ModeExplicit {
+		t.Fatalf("route.mode 应为 explicit: %+v", msg.Route)
+	}
+	if strings.Join(msg.Route.Groups, ",") != "team" {
+		t.Errorf("route.groups = %v, 期望 [team]", msg.Route.Groups)
+	}
+}
+
+func TestRoutingUnknownTarget(t *testing.T) {
+	h := startRoutedHarness(t, filepath.Join(t.TempDir(), "unipush.db"),
+		channel.Set{"bark": &fakeSender{name: "bark"}, "dingtalk": &fakeSender{name: "dingtalk"}},
+		testRouter(t), fastConfig())
+
+	_, err := h.disp.Enqueue(context.Background(), routedMessage("manual", model.LevelInfo, "telegram"))
+	var unknown *routing.UnknownTargetError
+	if !errors.As(err, &unknown) {
+		t.Fatalf("期望 UnknownTargetError，实际 %v", err)
+	}
+}
+
+func TestRoutingNoUsableChannel(t *testing.T) {
+	// bark 不可用，只有 dingtalk；nas 告警规则指向 phone → 无路可走。
+	h := startRoutedHarness(t, filepath.Join(t.TempDir(), "unipush.db"),
+		channel.Set{"dingtalk": &fakeSender{name: "dingtalk"}},
+		testRouter(t, "dingtalk"), fastConfig())
+
+	_, err := h.disp.Enqueue(context.Background(), routedMessage("nas-monitor", model.LevelError))
+	var noRoute *routing.NoRouteError
+	if !errors.As(err, &noRoute) {
+		t.Fatalf("期望 NoRouteError，实际 %v", err)
+	}
+	if !strings.Contains(err.Error(), "phone") {
+		t.Errorf("错误信息应指出目标组 phone: %s", err.Error())
 	}
 }

@@ -1,4 +1,4 @@
-# HTTP 接口说明（M1）
+# HTTP 接口说明（M1 + M2 路由）
 
 所有 `/v1/*` 接口要求 `Authorization: Bearer <token>`，token 来自 `UNIPUSH_AUTH_TOKEN`（可配置多个）。错误响应体统一为：
 
@@ -19,33 +19,34 @@ curl -sS -X POST http://127.0.0.1:8080/v1/messages \
     "body": "剩余空间 3%",
     "level": "error",
     "source": "nas-monitor",
-    "targets": ["bark", "dingtalk"],
+    "targets": ["team"],
     "link": "https://nas.local/alert/42",
     "dedupe_key": "nas-disk-42"
   }'
 ```
 
-成功响应：
+成功响应（本次显式指定了 `targets: ["team"]`，所以未走规则）：
 
 ```json
 {
   "id": "msg_3f6f...",
   "status": "queued",
   "created_at": "2026-01-01T08:00:00Z",
+  "route": {"mode": "explicit", "groups": ["team"], "channels": ["dingtalk"]},
   "deliveries": [
-    {"id": "dlv_...", "channel": "bark", "status": "pending"},
-    {"id": "dlv_...", "channel": "dingtalk", "status": "pending"}
+    {"id": "dlv_...", "channel": "dingtalk", "status": "pending", "groups": ["team"]}
   ]
 }
 ```
 
-同时返回 `Location: /v1/messages/{id}`。
+同时返回 `Location: /v1/messages/{id}`。不传 `targets` 时由 `config.yaml` 的 `routing` 规则决定投递渠道，`route.mode` 为 `rule` 或 `default`，详见 [routing.md](routing.md)。
 
 字段约束：
 
 - `title` 与 `body` 至少一个非空；`title` ≤200 字符，`body` ≤8000 字符
 - `level` ∈ `info`（缺省）/ `warn` / `error`
-- `targets` 只能引用启动时已启用的渠道；省略则投递到全部启用渠道
+- `source` 供路由规则匹配（≤64 字符）
+- `targets` 是显式投递目标：渠道组名（如 `phone` / `team`）或渠道名，只能引用启动时已启用的组/渠道；省略则按路由规则决定
 - `link` 必须是 http(s) 绝对地址
 - 请求体上限由 `server.max_body_bytes` 控制（默认 1 MiB）
 
@@ -54,10 +55,10 @@ curl -sS -X POST http://127.0.0.1:8080/v1/messages \
 | 状态码 | 含义 |
 | --- | --- |
 | 202 | 已入队 |
-| 400 | JSON 非法、字段缺失或取值非法（`error.message` 说明原因） |
+| 400 | JSON 非法、字段缺失或取值非法、`targets` 里有未知的组/渠道（`error.message` 列出可用值） |
 | 401 | token 缺失或无效 |
 | 413 | 请求体超过上限 |
-| 503 | 没有任何启用的渠道，且未显式指定 targets |
+| 503 | 没有任何启用渠道；或命中的规则/组没有可用渠道（`no_route`，`error.message` 说明是哪条规则/哪个组） |
 | 500 | 落库失败等内部错误 |
 
 ## GET /v1/messages/{id}
@@ -67,16 +68,22 @@ curl -sS http://127.0.0.1:8080/v1/messages/msg_3f6f... \
   -H "Authorization: Bearer $UNIPUSH_AUTH_TOKEN"
 ```
 
+下面这条 `ci` 来源的消息没有传 `targets`，由规则 `ci-build` 投到组 `team`：
+
 ```json
 {
   "message": {
     "id": "msg_3f6f...",
-    "title": "磁盘告警",
-    "body": "剩余空间 3%",
-    "level": "error",
-    "source": "nas-monitor",
-    "targets": ["bark", "dingtalk"],
-    "link": "https://nas.local/alert/42",
+    "title": "构建完成",
+    "body": "v1.2.3 已上线",
+    "level": "info",
+    "source": "ci",
+    "route": {
+      "mode": "rule",
+      "rule": "ci-build",
+      "groups": ["team"],
+      "channels": ["dingtalk"]
+    },
     "created_at": "2026-01-01T08:00:00Z"
   },
   "status": "succeeded",
@@ -84,10 +91,12 @@ curl -sS http://127.0.0.1:8080/v1/messages/msg_3f6f... \
     {
       "id": "dlv_...",
       "message_id": "msg_3f6f...",
-      "channel": "bark",
+      "channel": "dingtalk",
       "status": "succeeded",
       "attempts": 1,
       "max_attempts": 8,
+      "rule": "ci-build",
+      "groups": ["team"],
       "last_attempt_at": "2026-01-01T08:00:00Z",
       "succeeded_at": "2026-01-01T08:00:00Z",
       "created_at": "2026-01-01T08:00:00Z",
@@ -108,6 +117,17 @@ curl -sS http://127.0.0.1:8080/v1/messages/msg_3f6f... \
 | `failed` | 所有渠道最终失败 |
 
 单渠道 `status`：`pending`（等待/退避中）、`sending`（已认领）、`succeeded`、`failed`。失败原因在 `last_error`，下次尝试时间在 `next_attempt_at`。
+
+`message.route` 是路由解析结果：
+
+| 字段 | 含义 |
+| --- | --- |
+| `mode` | `explicit`（调用方指定 targets）/ `rule`（命中规则）/ `default`（默认目标） |
+| `rule` | 命中的规则名；默认目标为 `default`；显式指定时省略 |
+| `groups` | 命中的渠道组（按配置顺序）；显式指定渠道名时为空 |
+| `channels` | 最终投递的渠道（去重排序） |
+
+每条 delivery 的 `rule` / `groups` 说明该渠道是被哪条规则、哪些组带进来的；fan-out 时 `groups` 可能有多个。升级前的老消息没有 `route` 字段。
 
 不存在返回 404。
 

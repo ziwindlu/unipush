@@ -90,6 +90,10 @@ var migrations = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_deliveries_due ON deliveries(status, next_attempt_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_deliveries_message ON deliveries(message_id)`,
+	// M2：路由解析结果随消息落库，投递记录保留命中的规则与渠道组。
+	`ALTER TABLE messages ADD COLUMN route TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE deliveries ADD COLUMN rule TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE deliveries ADD COLUMN route_groups TEXT NOT NULL DEFAULT '[]'`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -133,6 +137,14 @@ func (s *Store) Enqueue(ctx context.Context, msg *model.Message, deliveries []*m
 	if err != nil {
 		return fmt.Errorf("store: 序列化 extra: %w", err)
 	}
+	route := ""
+	if msg.Route != nil {
+		encoded, err := json.Marshal(msg.Route)
+		if err != nil {
+			return fmt.Errorf("store: 序列化 route: %w", err)
+		}
+		route = string(encoded)
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -141,19 +153,24 @@ func (s *Store) Enqueue(ctx context.Context, msg *model.Message, deliveries []*m
 	defer tx.Rollback()
 
 	if _, err := tx.ExecContext(ctx, `INSERT INTO messages
-		(id, title, body, level, source, targets, dedupe_key, link, extra, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(id, title, body, level, source, targets, dedupe_key, link, extra, route, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		msg.ID, msg.Title, msg.Body, msg.Level, msg.Source, string(targets),
-		msg.DedupeKey, msg.Link, string(extra), msg.CreatedAt.UnixMilli()); err != nil {
+		msg.DedupeKey, msg.Link, string(extra), route, msg.CreatedAt.UnixMilli()); err != nil {
 		return fmt.Errorf("store: 写入消息: %w", err)
 	}
 	for _, d := range deliveries {
+		groups, err := json.Marshal(d.Groups)
+		if err != nil {
+			return fmt.Errorf("store: 序列化投递渠道组: %w", err)
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries
-			(id, message_id, channel, status, attempts, max_attempts, next_attempt_at,
-			 last_error, last_attempt_at, succeeded_at, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(id, message_id, channel, status, attempts, max_attempts, rule, route_groups,
+			 next_attempt_at, last_error, last_attempt_at, succeeded_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			d.ID, d.MessageID, d.Channel, string(d.Status), d.Attempts, d.MaxAttempts,
-			millisOrZero(d.NextAttemptAt), d.LastError, millisOf(d.LastAttemptAt), millisOf(d.SucceededAt),
+			d.Rule, string(groups), millisOrZero(d.NextAttemptAt), d.LastError,
+			millisOf(d.LastAttemptAt), millisOf(d.SucceededAt),
 			d.CreatedAt.UnixMilli(), d.UpdatedAt.UnixMilli()); err != nil {
 			return fmt.Errorf("store: 写入投递记录: %w", err)
 		}
@@ -167,12 +184,12 @@ func (s *Store) Enqueue(ctx context.Context, msg *model.Message, deliveries []*m
 // GetMessage 读取一条消息，不存在时返回 ErrNotFound。
 func (s *Store) GetMessage(ctx context.Context, id string) (*model.Message, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, title, body, level, source, targets,
-		dedupe_key, link, extra, created_at FROM messages WHERE id = ?`, id)
+		dedupe_key, link, extra, route, created_at FROM messages WHERE id = ?`, id)
 	msg := &model.Message{}
-	var targets, extra string
+	var targets, extra, route string
 	var createdAt int64
 	if err := row.Scan(&msg.ID, &msg.Title, &msg.Body, &msg.Level, &msg.Source, &targets,
-		&msg.DedupeKey, &msg.Link, &extra, &createdAt); err != nil {
+		&msg.DedupeKey, &msg.Link, &extra, &route, &createdAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -183,6 +200,12 @@ func (s *Store) GetMessage(ctx context.Context, id string) (*model.Message, erro
 	}
 	if err := json.Unmarshal([]byte(extra), &msg.Extra); err != nil {
 		return nil, fmt.Errorf("store: 解析 extra: %w", err)
+	}
+	if route != "" {
+		msg.Route = &model.Route{}
+		if err := json.Unmarshal([]byte(route), msg.Route); err != nil {
+			return nil, fmt.Errorf("store: 解析 route: %w", err)
+		}
 	}
 	msg.CreatedAt = time.UnixMilli(createdAt).UTC()
 	return msg, nil
@@ -212,7 +235,7 @@ func (s *Store) ListDeliveries(ctx context.Context, messageID string) ([]*model.
 }
 
 const selectDeliveryColumns = `SELECT id, message_id, channel, status, attempts, max_attempts,
-	next_attempt_at, last_error, last_attempt_at, succeeded_at, created_at, updated_at
+	rule, route_groups, next_attempt_at, last_error, last_attempt_at, succeeded_at, created_at, updated_at
 	FROM deliveries`
 
 // ClaimDue 认领最多 limit 条到期投递，并把它们标记为 sending。
@@ -336,12 +359,19 @@ func scanDelivery(row scanner) (*model.Delivery, error) {
 	d := &model.Delivery{}
 	var (
 		status                              string
+		groups                              string
 		nextAttempt, lastAttempt, succeeded sql.NullInt64
 		createdAt, updatedAt                int64
 	)
 	if err := row.Scan(&d.ID, &d.MessageID, &d.Channel, &status, &d.Attempts, &d.MaxAttempts,
-		&nextAttempt, &d.LastError, &lastAttempt, &succeeded, &createdAt, &updatedAt); err != nil {
+		&d.Rule, &groups, &nextAttempt, &d.LastError, &lastAttempt, &succeeded,
+		&createdAt, &updatedAt); err != nil {
 		return nil, fmt.Errorf("store: 扫描投递记录: %w", err)
+	}
+	if groups != "" {
+		if err := json.Unmarshal([]byte(groups), &d.Groups); err != nil {
+			return nil, fmt.Errorf("store: 解析投递渠道组: %w", err)
+		}
 	}
 	d.Status = model.DeliveryStatus(status)
 	d.NextAttemptAt = timePtr(nextAttempt)

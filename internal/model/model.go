@@ -26,6 +26,18 @@ func ValidLevel(level string) bool {
 	}
 }
 
+// Route 是一条消息被路由到哪些渠道的记录，用于回答「为什么发到了这里」。
+type Route struct {
+	// Mode 是命中来源：explicit（调用方显式指定）/ rule（命名规则）/ default（默认目标）。
+	Mode string `json:"mode"`
+	// Rule 是命中的规则名；显式指定时为空，默认目标为 "default"。
+	Rule string `json:"rule,omitempty"`
+	// Groups 是命中的渠道组（按配置顺序）。
+	Groups []string `json:"groups,omitempty"`
+	// Channels 是最终投递的渠道（已排序去重）。
+	Channels []string `json:"channels"`
+}
+
 // Message 是一条归一化后的待投递消息。
 type Message struct {
 	ID        string         `json:"id"`
@@ -37,7 +49,9 @@ type Message struct {
 	DedupeKey string         `json:"dedupe_key,omitempty"`
 	Link      string         `json:"link,omitempty"`
 	Extra     map[string]any `json:"extra,omitempty"`
-	CreatedAt time.Time      `json:"created_at"`
+	// Route 是路由解析结果；旧数据或未入队的消息可能为空。
+	Route     *Route    `json:"route,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // DeliveryStatus 是单条渠道投递的状态。
@@ -56,18 +70,22 @@ const (
 
 // Delivery 表示一条消息在某个渠道上的投递记录。
 type Delivery struct {
-	ID            string         `json:"id"`
-	MessageID     string         `json:"message_id"`
-	Channel       string         `json:"channel"`
-	Status        DeliveryStatus `json:"status"`
-	Attempts      int            `json:"attempts"`
-	MaxAttempts   int            `json:"max_attempts"`
-	NextAttemptAt *time.Time     `json:"next_attempt_at,omitempty"`
-	LastError     string         `json:"last_error,omitempty"`
-	LastAttemptAt *time.Time     `json:"last_attempt_at,omitempty"`
-	SucceededAt   *time.Time     `json:"succeeded_at,omitempty"`
-	CreatedAt     time.Time      `json:"created_at"`
-	UpdatedAt     time.Time      `json:"updated_at"`
+	ID          string         `json:"id"`
+	MessageID   string         `json:"message_id"`
+	Channel     string         `json:"channel"`
+	Status      DeliveryStatus `json:"status"`
+	Attempts    int            `json:"attempts"`
+	MaxAttempts int            `json:"max_attempts"`
+	// Rule 是这条投递的路由来源（规则名 / default / 空表示调用方显式指定）。
+	Rule string `json:"rule,omitempty"`
+	// Groups 是把该渠道带进来的渠道组，fan-out 时可能不止一个。
+	Groups        []string   `json:"groups,omitempty"`
+	NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
+	LastError     string     `json:"last_error,omitempty"`
+	LastAttemptAt *time.Time `json:"last_attempt_at,omitempty"`
+	SucceededAt   *time.Time `json:"succeeded_at,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
 // NewID 生成一个随机 ID，带前缀便于日志辨认（msg_ / dlv_）。

@@ -12,10 +12,11 @@ import (
 
 	"github.com/ziwindlu/unipush/internal/channel"
 	"github.com/ziwindlu/unipush/internal/model"
+	"github.com/ziwindlu/unipush/internal/routing"
 	"github.com/ziwindlu/unipush/internal/store"
 )
 
-// ErrNoChannels 表示服务没有启用任何可用渠道。
+// ErrNoChannels 表示服务没有启用任何可用渠道（仅在未配置路由、targets 为空时出现）。
 var ErrNoChannels = errors.New("没有可用渠道")
 
 // Config 是投递 worker 配置。
@@ -46,14 +47,16 @@ func DefaultConfig() Config {
 type Dispatcher struct {
 	store   *store.Store
 	senders channel.Set
-	cfg     Config
-	log     *slog.Logger
-	wake    chan struct{}
-	now     func() time.Time
+	// router 为 nil 时退化为 M1 行为：targets 即渠道名，不传表示全部启用渠道。
+	router *routing.Router
+	cfg    Config
+	log    *slog.Logger
+	wake   chan struct{}
+	now    func() time.Time
 }
 
-// New 创建 Dispatcher。
-func New(st *store.Store, senders channel.Set, cfg Config, logger *slog.Logger) *Dispatcher {
+// New 创建 Dispatcher。router 可以为 nil，表示不做规则路由。
+func New(st *store.Store, senders channel.Set, router *routing.Router, cfg Config, logger *slog.Logger) *Dispatcher {
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
 	}
@@ -81,6 +84,7 @@ func New(st *store.Store, senders channel.Set, cfg Config, logger *slog.Logger) 
 	return &Dispatcher{
 		store:   st,
 		senders: senders,
+		router:  router,
 		cfg:     cfg,
 		log:     logger,
 		wake:    make(chan struct{}, 1),
@@ -91,6 +95,14 @@ func New(st *store.Store, senders channel.Set, cfg Config, logger *slog.Logger) 
 // Channels 返回当前启用的渠道名（已排序）。
 func (dsp *Dispatcher) Channels() []string { return dsp.senders.Names() }
 
+// Groups 返回已配置的渠道组名（已排序）；未配置路由时为空。
+func (dsp *Dispatcher) Groups() []string {
+	if dsp.router == nil {
+		return nil
+	}
+	return dsp.router.Groups()
+}
+
 // Wake 通知 worker 有新消息或可以继续认领，不阻塞调用方。
 func (dsp *Dispatcher) Wake() {
 	select {
@@ -99,34 +111,31 @@ func (dsp *Dispatcher) Wake() {
 	}
 }
 
-// Enqueue 为消息创建各渠道的投递记录并落库。targets 为空表示投递到全部启用渠道。
+// Enqueue 解析路由、为每个目标渠道创建投递记录并落库。
+//
+// 路由顺序：调用方 targets（渠道组或渠道名）→ 按 source/level 命中的规则 → 默认目标。
+// 解析结果写入 msg.Route，并随每条 delivery 记录命中的规则与渠道组。
 func (dsp *Dispatcher) Enqueue(ctx context.Context, msg *model.Message) ([]*model.Delivery, error) {
-	available := dsp.senders.Names()
-	targets := model.NormalizeTargets(msg.Targets)
-	if len(targets) == 0 {
-		targets = available
-	}
-	if len(targets) == 0 {
-		return nil, ErrNoChannels
-	}
 	now := dsp.now()
 	if msg.CreatedAt.IsZero() {
 		msg.CreatedAt = now
 	}
-	// 记录实际投递目标，便于 GET /v1/messages/{id} 解释「发到了哪」。
-	msg.Targets = targets
 
-	deliveries := make([]*model.Delivery, 0, len(targets))
-	for _, name := range targets {
-		if _, ok := dsp.senders[name]; !ok {
-			return nil, fmt.Errorf("未知渠道 %q（可用: %s）", name, strings.Join(available, ", "))
-		}
+	channels, channelGroups, err := dsp.resolve(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	deliveries := make([]*model.Delivery, 0, len(channels))
+	for _, name := range channels {
 		deliveries = append(deliveries, &model.Delivery{
 			ID:            model.NewID("dlv_"),
 			MessageID:     msg.ID,
 			Channel:       name,
 			Status:        model.DeliveryPending,
 			MaxAttempts:   dsp.cfg.MaxAttempts,
+			Rule:          msg.Route.Rule,
+			Groups:        channelGroups[name],
 			NextAttemptAt: &now,
 			CreatedAt:     now,
 			UpdatedAt:     now,
@@ -139,6 +148,37 @@ func (dsp *Dispatcher) Enqueue(ctx context.Context, msg *model.Message) ([]*mode
 	}
 	dsp.Wake()
 	return deliveries, nil
+}
+
+// resolve 计算消息的投递渠道，并把结果写入 msg.Route。
+func (dsp *Dispatcher) resolve(msg *model.Message) ([]string, map[string][]string, error) {
+	if dsp.router != nil {
+		decision, err := dsp.router.Resolve(msg.Targets, msg.Source, msg.Level)
+		if err != nil {
+			return nil, nil, err
+		}
+		msg.Route = decision.Route()
+		return decision.Channels, decision.ChannelGroups, nil
+	}
+
+	// 未配置路由：targets 直接是渠道名，空表示全部启用渠道（M1 行为）。
+	available := dsp.senders.Names()
+	channels := model.NormalizeTargets(msg.Targets)
+	if len(channels) == 0 {
+		channels = available
+		msg.Route = &model.Route{Mode: routing.ModeDefault, Rule: "default", Channels: channels}
+	} else {
+		msg.Route = &model.Route{Mode: routing.ModeExplicit, Channels: channels}
+	}
+	if len(channels) == 0 {
+		return nil, nil, ErrNoChannels
+	}
+	for _, name := range channels {
+		if _, ok := dsp.senders[name]; !ok {
+			return nil, nil, fmt.Errorf("未知渠道 %q（可用: %s）", name, strings.Join(available, ", "))
+		}
+	}
+	return channels, nil, nil
 }
 
 // Run 启动 worker 并阻塞到 ctx 被取消。启动时会恢复上次进程遗留的在途投递。

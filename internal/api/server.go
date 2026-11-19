@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/ziwindlu/unipush/internal/model"
+	"github.com/ziwindlu/unipush/internal/routing"
 	"github.com/ziwindlu/unipush/internal/store"
 )
 
@@ -29,6 +30,7 @@ type Store interface {
 // Queue 是 API 需要的投递能力。
 type Queue interface {
 	Channels() []string
+	Groups() []string
 	Enqueue(ctx context.Context, msg *model.Message) ([]*model.Delivery, error)
 }
 
@@ -122,8 +124,7 @@ func (s *Server) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
 
 	deliveries, err := s.queue.Enqueue(r.Context(), msg)
 	if err != nil {
-		s.log.Error("消息入队失败", "error", err, "message_id", msg.ID)
-		s.writeError(w, http.StatusInternalServerError, "enqueue_failed", "消息入队失败: "+err.Error(), "")
+		s.writeEnqueueError(w, msg.ID, err)
 		return
 	}
 
@@ -131,6 +132,7 @@ func (s *Server) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
 		ID:         msg.ID,
 		Status:     "queued",
 		CreatedAt:  msg.CreatedAt,
+		Route:      msg.Route,
 		Deliveries: make([]deliverySummary, 0, len(deliveries)),
 	}
 	for _, d := range deliveries {
@@ -138,6 +140,7 @@ func (s *Server) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
 			ID:      d.ID,
 			Channel: d.Channel,
 			Status:  string(d.Status),
+			Groups:  d.Groups,
 		})
 	}
 	w.Header().Set("Location", "/v1/messages/"+msg.ID)
@@ -191,8 +194,12 @@ func (s *Server) buildMessage(req *createRequest) (*model.Message, *validationEr
 
 	targets := model.NormalizeTargets(req.Targets)
 	available := s.queue.Channels()
+	groups := s.queue.Groups()
 	if len(targets) > 0 {
-		known := make(map[string]struct{}, len(available))
+		known := make(map[string]struct{}, len(available)+len(groups))
+		for _, name := range groups {
+			known[name] = struct{}{}
+		}
 		for _, name := range available {
 			known[name] = struct{}{}
 		}
@@ -200,7 +207,8 @@ func (s *Server) buildMessage(req *createRequest) (*model.Message, *validationEr
 			if _, ok := known[name]; !ok {
 				return nil, &validationError{
 					http.StatusBadRequest, "invalid_request",
-					fmt.Sprintf("未知渠道 %q（可用渠道: %s）", name, strings.Join(available, ", ")),
+					fmt.Sprintf("未知投递目标 %q（可用渠道组: %s；可用渠道: %s）",
+						name, joinNames(groups), joinNames(available)),
 					"targets",
 				}
 			}
@@ -227,13 +235,39 @@ type createResponse struct {
 	ID         string            `json:"id"`
 	Status     string            `json:"status"`
 	CreatedAt  time.Time         `json:"created_at"`
+	Route      *model.Route      `json:"route,omitempty"`
 	Deliveries []deliverySummary `json:"deliveries"`
 }
 
 type deliverySummary struct {
-	ID      string `json:"id"`
-	Channel string `json:"channel"`
-	Status  string `json:"status"`
+	ID      string   `json:"id"`
+	Channel string   `json:"channel"`
+	Status  string   `json:"status"`
+	Groups  []string `json:"groups,omitempty"`
+}
+
+// writeEnqueueError 把路由与入队错误翻译成调用方能行动的 HTTP 响应：
+// 目标写错 → 400（field=targets）；目标没有可用渠道 → 503；其余 → 500。
+func (s *Server) writeEnqueueError(w http.ResponseWriter, messageID string, err error) {
+	var unknown *routing.UnknownTargetError
+	if errors.As(err, &unknown) {
+		s.writeError(w, http.StatusBadRequest, "invalid_request", unknown.Error(), "targets")
+		return
+	}
+	var noRoute *routing.NoRouteError
+	if errors.As(err, &noRoute) {
+		s.writeError(w, http.StatusServiceUnavailable, "no_route", noRoute.Error(), "targets")
+		return
+	}
+	s.log.Error("消息入队失败", "error", err, "message_id", messageID)
+	s.writeError(w, http.StatusInternalServerError, "enqueue_failed", "消息入队失败: "+err.Error(), "")
+}
+
+func joinNames(names []string) string {
+	if len(names) == 0 {
+		return "（无）"
+	}
+	return strings.Join(names, ", ")
 }
 
 func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {

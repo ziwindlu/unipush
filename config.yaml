@@ -41,3 +41,37 @@ channels:
     enabled: true
     webhook: ${DINGTALK_WEBHOOK}
     secret: ${DINGTALK_SECRET}
+
+# 路由：决定「一条消息发到哪」。
+# 调用方不用知道渠道名，只按来源/级别表达意图；加渠道或换渠道只改这里。
+#
+# 优先级：请求里的 targets（渠道组或渠道名）> 命中的第一条规则 > routing.default。
+# 任何未定义的组、未知渠道都会让服务启动失败，不会静默丢消息。
+routing:
+  # 渠道组：组名 → 渠道列表。组名不能和渠道名重名。
+  groups:
+    phone: [bark]          # 手机推送
+    team: [dingtalk]       # 钉钉群
+    all: [bark, dingtalk]  # 全渠道
+
+  # 没命中任何规则时投到哪里；留空则这类消息会被拒绝（503）。
+  default: [all]
+
+  # 规则按顺序求值，第一条命中的生效：更具体的放前面。
+  # sources 支持 shell 通配（含大小写不敏感的精确匹配）；levels 是 info / warn / error。
+  rules:
+    - name: nas-alerts
+      sources: ["nas-*"]
+      levels: [warn, error]
+      groups: [phone]
+
+    - name: ci-build
+      sources: [ci]
+      levels: [info, warn]
+      groups: [team]
+
+    # 其他来源的 error 级消息发全部渠道。
+    - name: error-everywhere
+      levels: [error]
+      groups: [all]
+

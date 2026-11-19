@@ -108,7 +108,7 @@ func TestEndToEndDeliversToBarkAndDingTalk(t *testing.T) {
 		t.Fatalf("dingtalk.New: %v", err)
 	}
 
-	dsp := dispatch.New(st, channel.Set{"bark": barkSender, "dingtalk": dingSender}, dispatch.Config{
+	dsp := dispatch.New(st, channel.Set{"bark": barkSender, "dingtalk": dingSender}, nil, dispatch.Config{
 		Workers:        2,
 		PollInterval:   5 * time.Millisecond,
 		Lease:          time.Minute,

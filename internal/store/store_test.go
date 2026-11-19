@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/ziwindlu/unipush/internal/model"
 	"github.com/ziwindlu/unipush/internal/store"
+
+	_ "modernc.org/sqlite"
 )
 
 func openStore(t *testing.T, path string) *store.Store {
@@ -284,5 +287,140 @@ func TestQueueSurvivesReopen(t *testing.T) {
 	}
 	if msg2.Body != msg.Body {
 		t.Errorf("重启后消息内容不一致: %q", msg2.Body)
+	}
+}
+
+func TestRouteDecisionRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t, filepath.Join(t.TempDir(), "unipush.db"))
+
+	msg := testMessage()
+	msg.Route = &model.Route{
+		Mode:     "rule",
+		Rule:     "nas-alerts",
+		Groups:   []string{"phone"},
+		Channels: []string{"bark"},
+	}
+	now := time.Now().UTC()
+	d := testDelivery(msg.ID, "bark", now)
+	d.Rule = "nas-alerts"
+	d.Groups = []string{"phone"}
+	if err := st.Enqueue(ctx, msg, []*model.Delivery{d}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	got, err := st.GetMessage(ctx, msg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage: %v", err)
+	}
+	if got.Route == nil {
+		t.Fatal("route 未落库")
+	}
+	if got.Route.Mode != "rule" || got.Route.Rule != "nas-alerts" {
+		t.Errorf("route = %+v", got.Route)
+	}
+	if len(got.Route.Groups) != 1 || got.Route.Groups[0] != "phone" ||
+		len(got.Route.Channels) != 1 || got.Route.Channels[0] != "bark" {
+		t.Errorf("route 组/渠道不一致: %+v", got.Route)
+	}
+
+	list, err := st.ListDeliveries(ctx, msg.ID)
+	if err != nil {
+		t.Fatalf("ListDeliveries: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("投递记录数 = %d", len(list))
+	}
+	if list[0].Rule != "nas-alerts" || len(list[0].Groups) != 1 || list[0].Groups[0] != "phone" {
+		t.Errorf("投递记录的规则/组不一致: rule=%q groups=%v", list[0].Rule, list[0].Groups)
+	}
+}
+
+func TestMessageWithoutRouteReadsBackNil(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t, filepath.Join(t.TempDir(), "unipush.db"))
+
+	msg := testMessage()
+	now := time.Now().UTC()
+	if err := st.Enqueue(ctx, msg, []*model.Delivery{testDelivery(msg.ID, "bark", now)}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	got, err := st.GetMessage(ctx, msg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage: %v", err)
+	}
+	if got.Route != nil {
+		t.Errorf("没有路由信息的消息应读回 nil，实际 %+v", got.Route)
+	}
+}
+
+// TestMigratesM1Database 验证 M1（schema v4）已有的库能平滑升级：
+// 老消息读回时没有 route，新写入的投递记录带规则与组。
+func TestMigratesM1Database(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "unipush.db")
+
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("打开旧库: %v", err)
+	}
+	m1Schema := []string{
+		`CREATE TABLE messages (
+			id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '',
+			level TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', targets TEXT NOT NULL DEFAULT '[]',
+			dedupe_key TEXT NOT NULL DEFAULT '', link TEXT NOT NULL DEFAULT '',
+			extra TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL)`,
+		`CREATE TABLE deliveries (
+			id TEXT PRIMARY KEY,
+			message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+			channel TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+			max_attempts INTEGER NOT NULL, next_attempt_at INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '', last_attempt_at INTEGER, succeeded_at INTEGER,
+			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+			UNIQUE (message_id, channel))`,
+		`CREATE INDEX idx_deliveries_due ON deliveries(status, next_attempt_at)`,
+		`CREATE INDEX idx_deliveries_message ON deliveries(message_id)`,
+		`PRAGMA user_version = 4`,
+	}
+	for _, stmt := range m1Schema {
+		if _, err := raw.ExecContext(ctx, stmt); err != nil {
+			raw.Close()
+			t.Fatalf("初始化 M1 库 (%s): %v", stmt, err)
+		}
+	}
+	now := time.Now().UTC()
+	if _, err := raw.ExecContext(ctx, `INSERT INTO messages (id, title, body, level, source, created_at)
+		VALUES ('msg_old', '旧消息', '正文', 'info', 'legacy', ?)`, now.UnixMilli()); err != nil {
+		raw.Close()
+		t.Fatalf("写入旧消息: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("关闭旧库: %v", err)
+	}
+
+	st := openStore(t, path)
+
+	old, err := st.GetMessage(ctx, "msg_old")
+	if err != nil {
+		t.Fatalf("升级后读取旧消息: %v", err)
+	}
+	if old.Route != nil {
+		t.Errorf("旧消息不应有 route，实际 %+v", old.Route)
+	}
+
+	msg := testMessage()
+	msg.Route = &model.Route{Mode: "rule", Rule: "nas-alerts", Groups: []string{"phone"}, Channels: []string{"bark"}}
+	d := testDelivery(msg.ID, "bark", now)
+	d.Rule = "nas-alerts"
+	d.Groups = []string{"phone"}
+	if err := st.Enqueue(ctx, msg, []*model.Delivery{d}); err != nil {
+		t.Fatalf("升级后写入新消息: %v", err)
+	}
+	list, err := st.ListDeliveries(ctx, msg.ID)
+	if err != nil {
+		t.Fatalf("ListDeliveries: %v", err)
+	}
+	if len(list) != 1 || list[0].Rule != "nas-alerts" || len(list[0].Groups) != 1 {
+		t.Fatalf("升级后投递记录不完整: %+v", list)
 	}
 }
