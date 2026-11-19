@@ -80,6 +80,8 @@ type DingTalk struct {
 	Enabled bool   `yaml:"enabled"`
 	Webhook string `yaml:"webhook"`
 	Secret  string `yaml:"secret"`
+	// Keyword 是机器人安全设置里的自定义关键词；非空时正文自动拼成「关键词: 内容」。
+	Keyword string `yaml:"keyword"`
 }
 
 // Default 返回内置默认值。
@@ -181,6 +183,7 @@ func (c *Config) normalize() {
 	c.Channels.Bark.Sound = strings.TrimSpace(c.Channels.Bark.Sound)
 	c.Channels.DingTalk.Webhook = strings.TrimSpace(c.Channels.DingTalk.Webhook)
 	c.Channels.DingTalk.Secret = strings.TrimSpace(c.Channels.DingTalk.Secret)
+	c.Channels.DingTalk.Keyword = strings.TrimSpace(c.Channels.DingTalk.Keyword)
 
 	tokens := make([]string, 0, len(c.Auth.Tokens))
 	for _, t := range c.Auth.Tokens {

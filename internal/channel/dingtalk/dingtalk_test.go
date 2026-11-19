@@ -176,3 +176,68 @@ func TestNewRejectsInvalidWebhook(t *testing.T) {
 		t.Fatal("空 webhook 应返回错误")
 	}
 }
+
+// TestSendPrefixesKeyword 锁定「关键词: 内容」的拼装格式，机器人开了自定义关键词校验时靠它放行。
+func TestSendPrefixesKeyword(t *testing.T) {
+	var gotContent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Text struct {
+				Content string `json:"content"`
+			} `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("解析请求体: %v", err)
+		}
+		gotContent = payload.Text.Content
+		io.WriteString(w, `{"errcode":0,"errmsg":"ok"}`)
+	}))
+	defer srv.Close()
+
+	s, err := dingtalk.New(dingtalk.Config{
+		Webhook: srv.URL + "/robot/send?access_token=t",
+		Keyword: "msg",
+		Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("dingtalk.New: %v", err)
+	}
+	if err := s.Send(context.Background(), &model.Message{Title: "磁盘告警", Body: "剩余 3%"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if want := "msg: 磁盘告警\n剩余 3%"; gotContent != want {
+		t.Errorf("正文 = %q, 期望 %q", gotContent, want)
+	}
+}
+
+// TestSendWithoutKeywordKeepsContent 说明关键词为空时不加前缀。
+func TestSendWithoutKeywordKeepsContent(t *testing.T) {
+	var gotContent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Text struct {
+				Content string `json:"content"`
+			} `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("解析请求体: %v", err)
+		}
+		gotContent = payload.Text.Content
+		io.WriteString(w, `{"errcode":0,"errmsg":"ok"}`)
+	}))
+	defer srv.Close()
+
+	s, err := dingtalk.New(dingtalk.Config{
+		Webhook: srv.URL + "/robot/send?access_token=t",
+		Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("dingtalk.New: %v", err)
+	}
+	if err := s.Send(context.Background(), &model.Message{Title: "磁盘告警", Body: "剩余 3%"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if want := "磁盘告警\n剩余 3%"; gotContent != want {
+		t.Errorf("正文 = %q, 期望 %q", gotContent, want)
+	}
+}

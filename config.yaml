@@ -41,6 +41,9 @@ channels:
     enabled: true
     webhook: ${DINGTALK_WEBHOOK}
     secret: ${DINGTALK_SECRET}
+    # 机器人「安全设置」里勾了「自定义关键词」时填这里：正文会自动拼成「关键词: 内容」。
+    # 留空表示机器人没开关键词校验。
+    keyword: ""
 
 # 路由：决定「一条消息发到哪」。
 # 调用方不用知道渠道名，只按来源/级别表达意图；加渠道或换渠道只改这里。

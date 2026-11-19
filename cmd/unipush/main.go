@@ -186,6 +186,7 @@ func buildSenders(cfg *config.Config, logger *slog.Logger) (channel.Set, error) 
 		s, err := dingtalk.New(dingtalk.Config{
 			Webhook: cfg.Channels.DingTalk.Webhook,
 			Secret:  cfg.Channels.DingTalk.Secret,
+			Keyword: cfg.Channels.DingTalk.Keyword,
 			Timeout: cfg.Dispatch.RequestTimeout,
 		})
 		if err != nil {
