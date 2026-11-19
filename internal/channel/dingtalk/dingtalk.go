@@ -26,6 +26,9 @@ type Config struct {
 	Webhook string
 	// Secret 是加签密钥；为空表示机器人未开启加签。
 	Secret string
+	// Keyword 是机器人安全设置里的自定义关键词。非空时正文拼成「关键词: 内容」，
+	// 否则钉钉会以 310000 关键词不匹配拒收；为空表示机器人没开关键词校验。
+	Keyword string
 	// Timeout 是单次请求超时，默认 10s。
 	Timeout time.Duration
 	// Now 可在测试中替换时钟，默认 time.Now。
@@ -41,6 +44,7 @@ type Sender struct {
 // New 创建钉钉适配器。
 func New(cfg Config) (*Sender, error) {
 	cfg.Webhook = strings.TrimSpace(cfg.Webhook)
+	cfg.Keyword = strings.TrimSpace(cfg.Keyword)
 	if cfg.Webhook == "" {
 		return nil, fmt.Errorf("dingtalk: webhook 为空")
 	}
@@ -84,7 +88,7 @@ func (s *Sender) Send(ctx context.Context, msg *model.Message) error {
 	payload := map[string]any{
 		"msgtype": "text",
 		"text": map[string]string{
-			"content": contentFor(msg),
+			"content": contentWithKeyword(s.cfg.Keyword, contentFor(msg)),
 		},
 	}
 	raw, err := json.Marshal(payload)
@@ -130,6 +134,19 @@ func (s *Sender) Send(ctx context.Context, msg *model.Message) error {
 		return channel.Permanent(err)
 	}
 	return nil
+}
+
+// contentWithKeyword 按机器人关键词校验的要求把正文拼成「关键词: 内容」。
+// keyword 为空时原样返回，兼容没开启关键词校验的机器人。
+func contentWithKeyword(keyword, content string) string {
+	keyword = strings.TrimSpace(keyword)
+	if keyword == "" {
+		return content
+	}
+	if strings.TrimSpace(content) == "" {
+		return keyword + ":"
+	}
+	return keyword + ": " + content
 }
 
 // contentFor 生成钉钉 text 消息正文：标题、正文、链接各占一行。

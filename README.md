@@ -109,6 +109,8 @@ DINGTALK_WEBHOOK=          # 钉钉机器人 webhook（含 access_token）
 DINGTALK_SECRET=           # 钉钉加签 secret（未开启加签可留空）
 ```
 
+钉钉机器人如果勾了「自定义关键词」安全设置，在 `config.yaml` 的 `channels.dingtalk.keyword` 填上关键词即可，正文会自动拼成 `关键词: 内容`；不填就按原样发送，机器人会以 `310000 关键词不匹配` 拒收。
+
 常用配置项见 `config.yaml` 注释；数据库路径、worker 数量、重试次数、退避上下限、请求超时都可调。
 
 `routing` 段定义渠道组与投递规则，是「消息发到哪」的唯一来源，完整说明见 [docs/routing.md](docs/routing.md)。
