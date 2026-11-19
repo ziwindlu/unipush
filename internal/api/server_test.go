@@ -25,6 +25,12 @@ type fakeStore struct {
 	aggregatedIDs []string
 	getErr        error
 	pingErr       error
+	listItems     []*store.MessageListItem
+	listHasMore   bool
+	listErr       error
+	queueStats    store.DeliveryQueueStats
+	statsErr      error
+	lastFilter    store.MessageFilter
 }
 
 func (f *fakeStore) GetMessage(ctx context.Context, id string) (*model.Message, error) {
@@ -43,6 +49,18 @@ func (f *fakeStore) ListDeliveries(ctx context.Context, messageID string) ([]*mo
 
 func (f *fakeStore) ListAggregatedMessages(ctx context.Context, digestID string) ([]string, error) {
 	return f.aggregatedIDs, nil
+}
+
+func (f *fakeStore) ListMessages(ctx context.Context, filter store.MessageFilter) ([]*store.MessageListItem, bool, error) {
+	f.lastFilter = filter
+	if f.listErr != nil {
+		return nil, false, f.listErr
+	}
+	return f.listItems, f.listHasMore, nil
+}
+
+func (f *fakeStore) DeliveryStats(ctx context.Context) (store.DeliveryQueueStats, error) {
+	return f.queueStats, f.statsErr
 }
 
 func (f *fakeStore) Ping(ctx context.Context) error { return f.pingErr }
@@ -407,5 +425,40 @@ func TestHealthz(t *testing.T) {
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("数据库异常时状态码 = %d, 期望 503", resp2.StatusCode)
+	}
+}
+
+// TestHealthzReportsQueueAndVersion 覆盖 M4：健康检查除了数据库，还暴露版本与队列积压情况。
+func TestHealthzReportsQueueAndVersion(t *testing.T) {
+	st := &fakeStore{queueStats: store.DeliveryQueueStats{Pending: 2, Succeeded: 5}}
+	ts := newTestAPI(t, st, &fakeQueue{channels: []string{"bark", "dingtalk"}}, func(c *Config) {
+		c.Version = "v1.2.3"
+	})
+	resp := requestJSON(t, ts, http.MethodGet, "/healthz", "", "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d", resp.StatusCode)
+	}
+	var body struct {
+		Status  string            `json:"status"`
+		Version string            `json:"version"`
+		Checks  map[string]string `json:"checks"`
+		Queue   struct {
+			Pending   int `json:"pending"`
+			Succeeded int `json:"succeeded"`
+		} `json:"queue"`
+		Channels []string `json:"channels"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("解析响应: %v", err)
+	}
+	if body.Status != "ok" || body.Version != "v1.2.3" || body.Checks["database"] != "ok" {
+		t.Errorf("健康检查字段不对: %+v", body)
+	}
+	if body.Queue.Pending != 2 || body.Queue.Succeeded != 5 {
+		t.Errorf("队列统计不对: %+v", body.Queue)
+	}
+	if len(body.Channels) != 2 {
+		t.Errorf("渠道列表不对: %+v", body.Channels)
 	}
 }

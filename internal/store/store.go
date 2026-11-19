@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ziwindlu/unipush/internal/model"
@@ -108,6 +109,9 @@ var migrations = []string{
 		UNIQUE (message_id)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_aggregates_pending ON aggregates(digest_id, bucket, created_at)`,
+	// M4：只读消息列表按创建时间倒序翻页；按来源过滤也走索引。
+	`CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC, id DESC)`,
+	`CREATE INDEX IF NOT EXISTS idx_messages_source_created ON messages(source, created_at DESC, id DESC)`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -382,6 +386,9 @@ const selectMessageFields = `id, title, body, level, source, targets, dedupe_key
 
 const selectMessageColumns = `SELECT ` + selectMessageFields + ` FROM messages`
 
+const selectMessageFieldsPrefixed = `m.id, m.title, m.body, m.level, m.source, m.targets, m.dedupe_key,
+	m.link, m.extra, m.route, m.merged_count, m.aggregated_into, m.digest_count, m.created_at`
+
 const selectMessageFieldsAliased = `m.id, m.title, m.body, m.level, m.source, m.targets, m.dedupe_key,
 	m.link, m.extra, m.route, m.merged_count, m.aggregated_into, m.digest_count, m.created_at`
 
@@ -399,12 +406,20 @@ func (s *Store) GetMessage(ctx context.Context, id string) (*model.Message, erro
 }
 
 func scanMessage(row scanner) (*model.Message, error) {
+	return scanMessageWith(row)
+}
+
+// scanMessageWith 读取消息的固定列，并把这些列之后的值扫进 extra。
+// 列表查询在消息列后面追加投递计数，复用同一套解码逻辑。
+func scanMessageWith(row scanner, extra ...any) (*model.Message, error) {
 	msg := &model.Message{}
-	var targets, extra, route string
+	var targets, extraJSON, route string
 	var createdAt int64
-	if err := row.Scan(&msg.ID, &msg.Title, &msg.Body, &msg.Level, &msg.Source, &targets,
-		&msg.DedupeKey, &msg.Link, &extra, &route, &msg.MergedCount, &msg.AggregatedInto,
-		&msg.DigestCount, &createdAt); err != nil {
+	dest := []any{&msg.ID, &msg.Title, &msg.Body, &msg.Level, &msg.Source, &targets,
+		&msg.DedupeKey, &msg.Link, &extraJSON, &route, &msg.MergedCount, &msg.AggregatedInto,
+		&msg.DigestCount, &createdAt}
+	dest = append(dest, extra...)
+	if err := row.Scan(dest...); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -413,7 +428,7 @@ func scanMessage(row scanner) (*model.Message, error) {
 	if err := json.Unmarshal([]byte(targets), &msg.Targets); err != nil {
 		return nil, fmt.Errorf("store: 解析 targets: %w", err)
 	}
-	if err := json.Unmarshal([]byte(extra), &msg.Extra); err != nil {
+	if err := json.Unmarshal([]byte(extraJSON), &msg.Extra); err != nil {
 		return nil, fmt.Errorf("store: 解析 extra: %w", err)
 	}
 	if route != "" {
@@ -470,6 +485,219 @@ func (s *Store) ListDeliveries(ctx context.Context, messageID string) ([]*model.
 		return nil, fmt.Errorf("store: 遍历投递记录: %w", err)
 	}
 	return out, nil
+}
+
+// MessageCursor 是 keyset 分页位置：下一页从严格早于这条消息的记录开始。
+type MessageCursor struct {
+	CreatedAt time.Time
+	ID        string
+}
+
+// MessageFilter 是只读消息列表的过滤条件；空字段表示不过滤。
+type MessageFilter struct {
+	Source string
+	Level  string
+	// Status 是聚合状态（queued / aggregated / in_progress / succeeded / partial / failed）。
+	Status string
+	// Since 只返回该时间之后创建的消息。
+	Since *time.Time
+	// Before 是上一页最后一条消息的位置。
+	Before *MessageCursor
+	Limit  int
+}
+
+// MessageListItem 是列表里的一条消息，附带投递计数。
+type MessageListItem struct {
+	Message *model.Message
+	// Status 是聚合后的消息状态；与 GET /v1/messages/{id} 一致。
+	Status string
+	Counts model.DeliveryCounts
+	// Deliveries 是各渠道投递记录（用于列表页显示状态与失败原因）。
+	Deliveries []*model.Delivery
+}
+
+// ListMessages 按创建时间倒序返回一页消息，并给出是否还有下一页。
+func (s *Store) ListMessages(ctx context.Context, f MessageFilter) ([]*MessageListItem, bool, error) {
+	if f.Limit <= 0 {
+		f.Limit = 20
+	}
+	query, args, err := buildListMessagesQuery(f)
+	if err != nil {
+		return nil, false, err
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, false, fmt.Errorf("store: 查询消息列表: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*MessageListItem
+	for rows.Next() {
+		var counts model.DeliveryCounts
+		msg, err := scanMessageWith(rows, &counts.Total, &counts.Pending, &counts.Succeeded, &counts.Failed)
+		if err != nil {
+			return nil, false, err
+		}
+		items = append(items, &MessageListItem{
+			Message: msg,
+			Status:  counts.Status(msg.AggregatedInto != ""),
+			Counts:  counts,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("store: 遍历消息列表: %w", err)
+	}
+
+	hasMore := len(items) > f.Limit
+	if hasMore {
+		items = items[:f.Limit]
+	}
+	if len(items) == 0 {
+		return items, false, nil
+	}
+	if err := s.attachDeliveries(ctx, items); err != nil {
+		return nil, false, err
+	}
+	return items, hasMore, nil
+}
+
+// buildListMessagesQuery 组装列表查询：先把投递状态聚合成计数，再按过滤条件筛选消息。
+func buildListMessagesQuery(f MessageFilter) (string, []any, error) {
+	conds := []string{"1=1"}
+	args := []any{}
+	if f.Source != "" {
+		conds = append(conds, "m.source = ?")
+		args = append(args, f.Source)
+	}
+	if f.Level != "" {
+		conds = append(conds, "m.level = ?")
+		args = append(args, f.Level)
+	}
+	if f.Since != nil {
+		conds = append(conds, "m.created_at >= ?")
+		args = append(args, f.Since.UTC().UnixMilli())
+	}
+	if f.Before != nil {
+		conds = append(conds, "(m.created_at < ? OR (m.created_at = ? AND m.id < ?))")
+		ms := f.Before.CreatedAt.UTC().UnixMilli()
+		args = append(args, ms, ms, f.Before.ID)
+	}
+	if f.Status != "" {
+		cond, ok := statusCondition(f.Status)
+		if !ok {
+			return "", nil, fmt.Errorf("store: 未知消息状态 %q", f.Status)
+		}
+		conds = append(conds, cond)
+	}
+
+	query := `WITH stats AS (
+		SELECT message_id, COUNT(*) AS total,
+			SUM(CASE WHEN status IN ('pending','sending') THEN 1 ELSE 0 END) AS pending,
+			SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded,
+			SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+		FROM deliveries GROUP BY message_id
+	)
+	SELECT ` + selectMessageFieldsPrefixed + `,
+		COALESCE(stats.total, 0), COALESCE(stats.pending, 0),
+		COALESCE(stats.succeeded, 0), COALESCE(stats.failed, 0)
+	FROM messages m LEFT JOIN stats ON stats.message_id = m.id
+	WHERE ` + strings.Join(conds, " AND ") + `
+	ORDER BY m.created_at DESC, m.id DESC
+	LIMIT ?`
+	args = append(args, f.Limit+1)
+	return query, args, nil
+}
+
+// statusCondition 把对外状态翻译成聚合计数上的条件。
+func statusCondition(status string) (string, bool) {
+	switch status {
+	case "queued":
+		return "COALESCE(stats.total, 0) = 0 AND m.aggregated_into = ''", true
+	case "aggregated":
+		return "COALESCE(stats.total, 0) = 0 AND m.aggregated_into <> ''", true
+	case "in_progress":
+		return "COALESCE(stats.pending, 0) > 0", true
+	case "succeeded":
+		return "COALESCE(stats.total, 0) > 0 AND COALESCE(stats.succeeded, 0) = stats.total", true
+	case "failed":
+		return "COALESCE(stats.total, 0) > 0 AND COALESCE(stats.failed, 0) = stats.total", true
+	case "partial":
+		return "COALESCE(stats.failed, 0) > 0 AND COALESCE(stats.succeeded, 0) > 0", true
+	default:
+		return "", false
+	}
+}
+
+// attachDeliveries 用一次查询补齐一页消息的投递记录，避免逐条查库。
+func (s *Store) attachDeliveries(ctx context.Context, items []*MessageListItem) error {
+	placeholders := make([]string, len(items))
+	args := make([]any, len(items))
+	byID := make(map[string]*MessageListItem, len(items))
+	for i, item := range items {
+		placeholders[i] = "?"
+		args[i] = item.Message.ID
+		byID[item.Message.ID] = item
+	}
+	rows, err := s.db.QueryContext(ctx, selectDeliveryColumns+
+		` WHERE message_id IN (`+strings.Join(placeholders, ",")+`)
+		ORDER BY message_id, created_at, channel`, args...)
+	if err != nil {
+		return fmt.Errorf("store: 查询列表投递记录: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		d, err := scanDelivery(rows)
+		if err != nil {
+			return err
+		}
+		if item, ok := byID[d.MessageID]; ok {
+			item.Deliveries = append(item.Deliveries, d)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("store: 遍历列表投递记录: %w", err)
+	}
+	return nil
+}
+
+// DeliveryQueueStats 是各状态投递记录的总数，供 /healthz 展示队列是否堆积。
+type DeliveryQueueStats struct {
+	Pending   int `json:"pending"`
+	Sending   int `json:"sending"`
+	Succeeded int `json:"succeeded"`
+	Failed    int `json:"failed"`
+}
+
+// DeliveryStats 汇总各状态投递记录数量。
+func (s *Store) DeliveryStats(ctx context.Context) (DeliveryQueueStats, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM deliveries GROUP BY status`)
+	if err != nil {
+		return DeliveryQueueStats{}, fmt.Errorf("store: 统计投递状态: %w", err)
+	}
+	defer rows.Close()
+
+	var stats DeliveryQueueStats
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			return DeliveryQueueStats{}, fmt.Errorf("store: 扫描投递统计: %w", err)
+		}
+		switch model.DeliveryStatus(status) {
+		case model.DeliveryPending:
+			stats.Pending = count
+		case model.DeliverySending:
+			stats.Sending = count
+		case model.DeliverySucceeded:
+			stats.Succeeded = count
+		case model.DeliveryFailed:
+			stats.Failed = count
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return DeliveryQueueStats{}, fmt.Errorf("store: 遍历投递统计: %w", err)
+	}
+	return stats, nil
 }
 
 const selectDeliveryColumns = `SELECT id, message_id, channel, status, attempts, max_attempts,

@@ -297,3 +297,64 @@ func TestLoadRejectsInvalidM3Settings(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadLogDefaultsAndOverrides 覆盖 M4：日志格式/级别既能在配置文件里写，也能用环境变量覆盖。
+func TestLoadLogDefaultsAndOverrides(t *testing.T) {
+	path := writeConfig(t, `
+auth:
+  tokens: [test-token]
+channels:
+  bark: {enabled: false}
+  dingtalk: {enabled: false}
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Log.Format != "text" || cfg.Log.Level != "info" {
+		t.Fatalf("日志默认值错误: %+v", cfg.Log)
+	}
+
+	t.Setenv("UNIPUSH_LOG_FORMAT", "JSON")
+	t.Setenv("UNIPUSH_LOG_LEVEL", "debug")
+	cfg, err = config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Log.Format != "json" || cfg.Log.Level != "debug" {
+		t.Fatalf("环境变量没有覆盖日志配置: %+v", cfg.Log)
+	}
+}
+
+// TestLoadRejectsInvalidLogSettings 保证写错格式/级别在启动时就报错，而不是静默回退。
+func TestLoadRejectsInvalidLogSettings(t *testing.T) {
+	for _, tc := range []struct{ name, body, want string }{
+		{"format", "log:\n  format: xml\n", "log.format"},
+		{"level", "log:\n  level: verbose\n", "log.level"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, "auth:\n  tokens: [test-token]\n"+tc.body)
+			_, err := config.Load(path)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("期望 %q 校验错误，实际: %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// TestLoadEnvOverridesAddrAndDatabase 让同一份 config.yaml 能在容器里换成 0.0.0.0 和 /data。
+func TestLoadEnvOverridesAddrAndDatabase(t *testing.T) {
+	t.Setenv("UNIPUSH_ADDR", "0.0.0.0:9090")
+	t.Setenv("UNIPUSH_DB_PATH", "/data/unipush.db")
+	path := writeConfig(t, "auth:\n  tokens: [test-token]\n")
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Server.Addr != "0.0.0.0:9090" {
+		t.Errorf("UNIPUSH_ADDR 未生效: %s", cfg.Server.Addr)
+	}
+	if cfg.Database.Path != "/data/unipush.db" {
+		t.Errorf("UNIPUSH_DB_PATH 未生效: %s", cfg.Database.Path)
+	}
+}

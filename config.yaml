@@ -4,6 +4,7 @@
 # 仓库里只保留 .env.example 占位。
 server:
   # 只监听本机，公网暴露请放到反向代理后并开启鉴权。
+  # 容器里可用环境变量 UNIPUSH_ADDR=0.0.0.0:8080 覆盖。
   addr: "127.0.0.1:8080"
   read_timeout: 15s
   write_timeout: 15s
@@ -18,6 +19,7 @@ auth:
 
 database:
   # 数据目录不入库；SQLite 会同时产生 -wal / -shm 文件。
+  # 容器里可用环境变量 UNIPUSH_DB_PATH=/data/unipush.db 覆盖。
   path: "./data/unipush.db"
 
 dispatch:
@@ -128,3 +130,9 @@ aggregation:
   enabled: true
   window: 1m
   max_items: 50
+
+# 日志：text 适合前台人读，json 一行一条适合容器采集。
+# 也支持环境变量覆盖：UNIPUSH_LOG_FORMAT / UNIPUSH_LOG_LEVEL。
+log:
+  format: text
+  level: info

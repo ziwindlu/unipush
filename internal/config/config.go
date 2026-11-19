@@ -25,6 +25,7 @@ type Config struct {
 	Routing     routing.Config `yaml:"routing"`
 	Dedupe      Dedupe         `yaml:"dedupe"`
 	Aggregation Aggregation    `yaml:"aggregation"`
+	Log         Log            `yaml:"log"`
 
 	// Warnings 记录加载过程中被降级处理的配置（例如渠道凭据缺失）。
 	Warnings []string `yaml:"-"`
@@ -137,6 +138,14 @@ type Aggregation struct {
 	MaxItems int `yaml:"max_items"`
 }
 
+// Log 是日志配置。部署到容器或日志采集时切成 json，一行一条便于检索。
+type Log struct {
+	// Format 是输出格式：text（默认，人读）/ json（一行一条，采集用）。
+	Format string `yaml:"format"`
+	// Level 是最低输出级别：debug / info（默认）/ warn / error。
+	Level string `yaml:"level"`
+}
+
 // Bark 是 Bark 渠道配置。
 type Bark struct {
 	Enabled   bool   `yaml:"enabled"`
@@ -195,6 +204,7 @@ func Default() *Config {
 		},
 		Dedupe:      Dedupe{Enabled: true, Window: 5 * time.Minute},
 		Aggregation: Aggregation{Enabled: true, Window: time.Minute, MaxItems: 50},
+		Log:         Log{Format: "text", Level: "info"},
 	}
 }
 
@@ -261,6 +271,13 @@ func LoadDotEnv(path string) (int, error) {
 }
 
 func (c *Config) normalize() {
+	// 容器里不改配置文件也能覆盖监听地址和数据库路径（Docker 默认 0.0.0.0 + /data）。
+	if v := strings.TrimSpace(os.Getenv("UNIPUSH_ADDR")); v != "" {
+		c.Server.Addr = v
+	}
+	if v := strings.TrimSpace(os.Getenv("UNIPUSH_DB_PATH")); v != "" {
+		c.Database.Path = v
+	}
 	c.Server.Addr = strings.TrimSpace(c.Server.Addr)
 	c.Database.Path = strings.TrimSpace(c.Database.Path)
 	c.Channels.Bark.ServerURL = strings.TrimRight(strings.TrimSpace(c.Channels.Bark.ServerURL), "/")
@@ -321,6 +338,22 @@ func (c *Config) normalize() {
 			}
 		}
 		c.Channels.Webhook.Headers = headers
+	}
+
+	// 日志格式与级别也支持环境变量覆盖，容器里不用改配置文件。
+	if v := strings.TrimSpace(os.Getenv("UNIPUSH_LOG_FORMAT")); v != "" {
+		c.Log.Format = v
+	}
+	if v := strings.TrimSpace(os.Getenv("UNIPUSH_LOG_LEVEL")); v != "" {
+		c.Log.Level = v
+	}
+	c.Log.Format = strings.ToLower(strings.TrimSpace(c.Log.Format))
+	if c.Log.Format == "" {
+		c.Log.Format = "text"
+	}
+	c.Log.Level = strings.ToLower(strings.TrimSpace(c.Log.Level))
+	if c.Log.Level == "" {
+		c.Log.Level = "info"
 	}
 
 	tokens := make([]string, 0, len(c.Auth.Tokens))
@@ -429,6 +462,16 @@ func (c *Config) validate() error {
 		if c.Aggregation.MaxItems < 1 {
 			return fmt.Errorf("aggregation.max_items 必须 >= 1")
 		}
+	}
+	switch c.Log.Format {
+	case "text", "json":
+	default:
+		return fmt.Errorf("log.format 只能是 text 或 json，当前是 %q", c.Log.Format)
+	}
+	switch c.Log.Level {
+	case "debug", "info", "warn", "error":
+	default:
+		return fmt.Errorf("log.level 只能是 debug / info / warn / error，当前是 %q", c.Log.Level)
 	}
 	return nil
 }

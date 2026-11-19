@@ -23,8 +23,10 @@ import (
 // Store 是 API 需要的持久化能力。
 type Store interface {
 	GetMessage(ctx context.Context, id string) (*model.Message, error)
+	ListMessages(ctx context.Context, filter store.MessageFilter) ([]*store.MessageListItem, bool, error)
 	ListDeliveries(ctx context.Context, messageID string) ([]*model.Delivery, error)
 	ListAggregatedMessages(ctx context.Context, digestID string) ([]string, error)
+	DeliveryStats(ctx context.Context) (store.DeliveryQueueStats, error)
 	Ping(ctx context.Context) error
 }
 
@@ -41,15 +43,18 @@ type Config struct {
 	AuthTokens []string
 	// MaxBodyBytes 是请求体大小上限。
 	MaxBodyBytes int64
+	// Version 会出现在 /healthz 里，方便确认线上跑的是哪个版本。
+	Version string
 }
 
 // Server 是 HTTP 处理器。
 type Server struct {
-	cfg   Config
-	store Store
-	queue Queue
-	log   *slog.Logger
-	mux   *http.ServeMux
+	cfg       Config
+	store     Store
+	queue     Queue
+	log       *slog.Logger
+	mux       *http.ServeMux
+	startedAt time.Time
 }
 
 // New 创建 API Server。
@@ -60,9 +65,10 @@ func New(cfg Config, st Store, queue Queue, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{cfg: cfg, store: st, queue: queue, log: logger, mux: http.NewServeMux()}
+	s := &Server{cfg: cfg, store: st, queue: queue, log: logger, mux: http.NewServeMux(), startedAt: time.Now()}
 
 	s.mux.Handle("POST /v1/messages", s.requireAuth(http.HandlerFunc(s.handleCreateMessage)))
+	s.mux.Handle("GET /v1/messages", s.requireAuth(http.HandlerFunc(s.handleListMessages)))
 	s.mux.Handle("GET /v1/messages/{id}", s.requireAuth(http.HandlerFunc(s.handleGetMessage)))
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("/", s.handleNotFound)
@@ -329,48 +335,50 @@ type getResponse struct {
 }
 
 func aggregateStatus(msg *model.Message, deliveries []*model.Delivery) string {
-	if len(deliveries) == 0 {
-		if msg != nil && msg.AggregatedInto != "" {
-			// 已汇入 digest 的原始 info 消息，它自己不会再有投递记录。
-			return "aggregated"
-		}
-		return "queued"
-	}
-	var pending, succeeded, failed bool
+	var counts model.DeliveryCounts
 	for _, d := range deliveries {
-		switch d.Status {
-		case model.DeliveryPending, model.DeliverySending:
-			pending = true
-		case model.DeliverySucceeded:
-			succeeded = true
-		case model.DeliveryFailed:
-			failed = true
-		}
+		counts.Add(d.Status)
 	}
-	switch {
-	case pending:
-		return "in_progress"
-	case succeeded && failed:
-		return "partial"
-	case failed:
-		return "failed"
-	default:
-		return "succeeded"
-	}
+	// 已汇入 digest 的原始 info 消息自己不会再有投递记录。
+	return counts.Status(msg != nil && msg.AggregatedInto != "")
+}
+
+// healthResponse 是 /healthz 的响应体。数据库不可用时返回 503，
+// 队列积压不算不健康（消息还在重试），只是把数字暴露出来便于排查。
+type healthResponse struct {
+	Status        string                    `json:"status"`
+	Version       string                    `json:"version,omitempty"`
+	UptimeSeconds int64                     `json:"uptime_seconds"`
+	Checks        map[string]string         `json:"checks"`
+	Queue         *store.DeliveryQueueStats `json:"queue,omitempty"`
+	Channels      []string                  `json:"channels,omitempty"`
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
+
+	resp := healthResponse{
+		Status:        "ok",
+		Version:       s.cfg.Version,
+		UptimeSeconds: int64(time.Since(s.startedAt).Seconds()),
+		Checks:        map[string]string{"database": "ok"},
+		Channels:      s.queue.Channels(),
+	}
+	status := http.StatusOK
 	if err := s.store.Ping(ctx); err != nil {
 		s.log.Error("健康检查失败", "error", err)
-		s.writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-			"status": "unavailable",
-			"error":  err.Error(),
-		})
-		return
+		resp.Status = "unavailable"
+		resp.Checks["database"] = "unavailable"
+		status = http.StatusServiceUnavailable
+	} else if stats, err := s.store.DeliveryStats(ctx); err != nil {
+		s.log.Error("健康检查读取队列统计失败", "error", err)
+		resp.Status = "degraded"
+		resp.Checks["queue"] = "unavailable"
+	} else {
+		resp.Queue = &stats
 	}
-	s.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	s.writeJSON(w, status, resp)
 }
 
 func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
