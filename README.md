@@ -10,7 +10,7 @@
 
 ## 状态
 
-M2 已完成：在 M1（单一入口 + Bearer 鉴权、Bark / 钉钉适配器、SQLite 落盘队列、指数退避重试、投递状态查询、优雅退出）之上加了**渠道组与投递规则**——按来源/级别决定发到哪里，调用方不改代码；显式 `targets` 可覆盖规则；配置写错（未知组 / 未知渠道）启动即失败；路由结果随消息与投递记录落库，可查「为什么发到了这里」。更多渠道与去重聚合（M3）、Docker/CLI/部署文档（M4）在后续任务中实现。
+M3 已完成：在 M1（单一入口 + Bearer 鉴权、Bark / 钉钉适配器、SQLite 落盘队列、指数退避重试、投递状态查询、优雅退出）与 M2（渠道组、按来源/级别的路由规则）之上补齐了**飞书 / 企业微信 / SMTP 邮件 / 通用 HTTP webhook**，并实现了**去重与聚合**——同一 `dedupe_key` 在窗口内只投递一次并累加合并次数，`info` 级消息按来源与投递目标攒成 digest 发送，`warn` / `error` 立即投递。Docker/CLI/部署文档（M4）在后续任务中实现。
 
 ## 快速开始
 
@@ -38,6 +38,8 @@ curl -sS -X POST http://127.0.0.1:8080/v1/messages \
     "link": "https://example.com/run/1"
   }'
 ```
+
+> `level` 为 `info` 时消息会先进入聚合窗口（默认 1 分钟）再发 digest；想立刻看到投递，用 `warn` / `error`，或把 `aggregation.enabled` 设为 `false`。
 
 返回 `202 Accepted`。`config.yaml` 里 `ci` + `warn` 命中规则 `ci-build` → 组 `team`，所以只排队到钉钉；响应里的 `route` 说明这次为什么发到这里：
 
@@ -80,7 +82,7 @@ curl -sS http://127.0.0.1:8080/v1/messages/msg_... -H "Authorization: Bearer $UN
 | `level` | 否 | `info`（默认）/ `warn` / `error` |
 | `source` | 否 | 来源标识，路由规则按它匹配（例如 `ci`、`nas-monitor`） |
 | `targets` | 否 | 显式指定投递目标：渠道组名（如 `phone`、`team`）或渠道名；不传则按路由规则决定 |
-| `dedupe_key` | 否 | 去重键，M1 先记录，M3 实现合并 |
+| `dedupe_key` | 否 | 去重键：同一 key 在窗口内只投递一次，其余只累加合并次数 |
 | `link` | 否 | http(s) 链接，Bark 可点击打开 |
 | `extra` | 否 | 任意附加字段，原样保存 |
 
@@ -97,6 +99,8 @@ curl -sS http://127.0.0.1:8080/v1/messages/msg_... -H "Authorization: Bearer $UN
 - **重启不重不发**：启动时把上次处于 `sending` 的投递重新入队；已 `succeeded` 的渠道不会再次发送。
 - **渠道隔离**：单个渠道失败或超时不影响其他渠道。
 - **路由可解释**：每次投递都记录命中的规则与渠道组（`route` / `delivery.rule` / `delivery.groups`），排障不用猜；路由配置错误在启动时暴露，不会静默丢消息。
+- **去重**：同一 `dedupe_key` 在 `dedupe.window`（默认 5 分钟）内只投递一次，重复消息只把原消息的 `merged_count` 加一；窗口从第一条消息开始算，不会被后续重复无限延长。
+- **聚合**：`info` 级消息按「来源 + targets」在 `aggregation.window`（默认 1 分钟）内合并成一条 digest，攒够 `max_items` 提前发送，优雅退出时把剩余消息发掉；`warn` / `error` 不聚合，立即投递。
 
 ## 配置
 
@@ -107,9 +111,18 @@ UNIPUSH_AUTH_TOKEN=        # 调用方 Bearer Token，至少一个；不配置�
 BARK_DEVICE_KEY=           # Bark 设备 key
 DINGTALK_WEBHOOK=          # 钉钉机器人 webhook（含 access_token）
 DINGTALK_SECRET=           # 钉钉加签 secret（未开启加签可留空）
+FEISHU_WEBHOOK=            # 飞书自定义机器人 webhook
+FEISHU_SECRET=             # 飞书加签 secret（未开启加签可留空）
+WECOM_WEBHOOK=             # 企业微信群机器人 webhook（含 key=）
+SMTP_USERNAME=             # SMTP 账号
+SMTP_PASSWORD=             # SMTP 密码 / 授权码
+SMTP_FROM=                 # 发件人地址
+WEBHOOK_URL=               # 通用 webhook 目标地址
 ```
 
 钉钉机器人如果勾了「自定义关键词」安全设置，在 `config.yaml` 的 `channels.dingtalk.keyword` 填上关键词即可，正文会自动拼成 `关键词: 内容`；不填就按原样发送，机器人会以 `310000 关键词不匹配` 拒收。
+
+每个渠道的配置样例、签名/限流差异和实测 curl 命令见 [docs/channels.md](docs/channels.md)。
 
 常用配置项见 `config.yaml` 注释；数据库路径、worker 数量、重试次数、退避上下限、请求超时都可调。
 
@@ -122,10 +135,11 @@ go test ./...
 go test -race ./...
 ```
 
-- `internal/channel/bark` / `internal/channel/dingtalk`：基于 `httptest` 验证请求体、Bark 级别映射、钉钉 HMAC-SHA256 加签、错误分类（可重试 / 不可重试）
+- `internal/channel/bark` / `dingtalk` / `feishu` / `wecom` / `webhook`：基于 `httptest` 验证请求体、签名、错误分类（可重试 / 不可重试）、限流与错误码映射
+- `internal/channel/email`：本地假 SMTP 服务器验证 multipart 邮件结构、中文主题编码、HTML 转义、5xx 不可重试与连接失败可重试
 - `internal/store`：落库、到期认领、租约、重启恢复、状态回写
 - `internal/routing`：按来源/级别命中规则、默认目标、显式 targets 覆盖、fan-out 去重、禁用渠道过滤，以及未知组 / 未知渠道 / 非法级别的启动校验
-- `internal/dispatch`：多渠道路由、按规则选渠道、显式覆盖、重试后成功、重试耗尽、永久失败、断网恢复、重启不重复发送
+- `internal/dispatch`：多渠道路由、按规则选渠道、显式覆盖、重试后成功、重试耗尽、永久失败、断网恢复、重启不重复发送；去重（同 key 连发 10 次只投 1 次、窗口过期后重投）与聚合（窗口到期 / 攒够条数才发 digest、error 不聚合、不同 targets 不混桶）
 - `internal/api`：401 / 400 / 413 / 503、字段归一化、查询聚合状态，以及两条端到端用例（同时打到 Bark + 钉钉；按来源路由 / 显式覆盖 / 查询路由结果）
 
 ## 目录
@@ -133,7 +147,7 @@ go test -race ./...
 ```
 cmd/unipush/        # 入口与优雅退出
 internal/api/       # HTTP 接口与鉴权
-internal/channel/   # 渠道适配器契约（bark/、dingtalk/）
+internal/channel/   # 渠道适配器契约与实现（bark/、dingtalk/、feishu/、wecom/、email/、webhook/）
 internal/config/    # YAML + .env 加载与校验
 internal/dispatch/  # 投递 worker、重试与退避
 internal/model/     # 消息、投递记录与路由结果模型
@@ -148,5 +162,5 @@ docs/               # 接口与路由说明
 | --- | --- | --- |
 | M1 | 消息入口、Bark/钉钉适配器、SQLite outbox、重试 | ✅ 已完成 |
 | M2 | 渠道组与按来源/级别的路由规则 | ✅ 已完成 |
-| M3 | 飞书/企微/邮件/Webhook、去重与聚合 | 待开始 |
+| M3 | 飞书/企微/邮件/Webhook、去重与聚合 | ✅ 已完成 |
 | M4 | Docker、CLI、只读消息列表、部署文档 | 待开始 |

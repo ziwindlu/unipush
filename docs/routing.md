@@ -80,7 +80,7 @@ curl -sS -X POST http://127.0.0.1:8080/v1/messages \
 以下情况服务**直接启动失败**，错误信息带上 `config.yaml` 里的位置：
 
 - 规则或默认目标引用了未定义的组：`routing.rules[0].groups[0]: 未定义的渠道组 "ghost"`
-- 组里出现未知渠道：`routing.groups.phone.channels[1]: 未知渠道 "feishu"`
+- 组里出现未知渠道：`routing.groups.phone.channels[1]: 未知渠道 "telegram"`
 - 组为空、组名与渠道名冲突、规则重名、规则没有匹配条件、规则没有目标组、非法通配模式、未知级别
 
 渠道凭据缺失（例如没配 `BARK_DEVICE_KEY`）不会让服务起不来，但会在启动日志里告警「渠道组 phone 里没有已启用的渠道」。命中这种组的消息会返回 `503 no_route` 并在错误里说明原因，而不是静默丢弃。

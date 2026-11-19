@@ -44,6 +44,40 @@ channels:
     # 机器人「安全设置」里勾了「自定义关键词」时填这里：正文会自动拼成「关键词: 内容」。
     # 留空表示机器人没开关键词校验。
     keyword: ""
+  # 飞书自定义机器人：secret 是该机器人开启「加签」后得到的密钥，未开启可留空。
+  # msg_type: text（默认，纯文本）或 card（带标题配色的卡片）。
+  feishu:
+    enabled: true
+    webhook: ${FEISHU_WEBHOOK}
+    secret: ${FEISHU_SECRET}
+    msg_type: text
+  # 企业微信群机器人：msg_type: markdown（默认，支持加粗/链接）或 text。
+  wecom:
+    enabled: true
+    webhook: ${WECOM_WEBHOOK}
+    msg_type: markdown
+  # SMTP 邮件：tls 可选 starttls（默认）/ ssl（465）/ none（内网中继）。
+  # 只要 host / from / to 有一项为空，该渠道会在启动时自动禁用并给出告警。
+  email:
+    enabled: true
+    host: smtp.qq.com
+    port: 587
+    username: ${SMTP_USERNAME}
+    password: ${SMTP_PASSWORD}
+    from: ${SMTP_FROM}
+    to: []          # 收件人列表，例如 ["me@example.com"]
+    tls: starttls
+    subject_prefix: "[unipush]"
+  # 通用 HTTP webhook：body_template 是 Go text/template，
+  # 可用 {{.Title}} {{.Body}} {{.Level}} {{.Source}} {{.Link}} {{.JSON}} {{.Extra.xxx}}；
+  # 留空则直接把消息的 JSON 发过去。
+  webhook:
+    enabled: true
+    url: ${WEBHOOK_URL}
+    method: POST
+    headers: {}
+    content_type: "application/json; charset=utf-8"
+    body_template: ""
 
 # 路由：决定「一条消息发到哪」。
 # 调用方不用知道渠道名，只按来源/级别表达意图；加渠道或换渠道只改这里。
@@ -53,9 +87,12 @@ channels:
 routing:
   # 渠道组：组名 → 渠道列表。组名不能和渠道名重名。
   groups:
-    phone: [bark]          # 手机推送
-    team: [dingtalk]       # 钉钉群
-    all: [bark, dingtalk]  # 全渠道
+    phone: [bark]                       # 手机推送
+    team: [dingtalk]                    # 钉钉群
+    chat: [feishu, wecom]               # 飞书 / 企微群
+    mail: [email]                       # 邮件
+    hooks: [webhook]                    # 通用 webhook
+    all: [bark, dingtalk, feishu, wecom, email, webhook]  # 全渠道
 
   # 没命中任何规则时投到哪里；留空则这类消息会被拒绝（503）。
   default: [all]
@@ -78,3 +115,16 @@ routing:
       levels: [error]
       groups: [all]
 
+
+# 去重：同一 dedupe_key 在窗口内只真正投递一次，其余只累加「合并次数」。
+# 窗口从第一条消息的创建时间开始算，不会因为后续重复而延长。
+dedupe:
+  enabled: true
+  window: 5m
+
+# 聚合：info 级消息按「来源 + targets」在窗口内攒成一条 digest 再发，
+# error / warn 一律立即投递。攒够 max_items 会提前发送；进程优雅退出时会把剩余消息发掉。
+aggregation:
+  enabled: true
+  window: 1m
+  max_items: 50

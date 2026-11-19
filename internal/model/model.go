@@ -50,8 +50,39 @@ type Message struct {
 	Link      string         `json:"link,omitempty"`
 	Extra     map[string]any `json:"extra,omitempty"`
 	// Route 是路由解析结果；旧数据或未入队的消息可能为空。
-	Route     *Route    `json:"route,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	Route *Route `json:"route,omitempty"`
+	// MergedCount 是同一 dedupe_key 在去重窗口内被合并掉的次数。
+	MergedCount int `json:"merged_count,omitempty"`
+	// AggregatedInto 是这条 info 消息被汇总进哪条 digest 消息的 ID。
+	AggregatedInto string `json:"aggregated_into,omitempty"`
+	// DigestCount 是这条 digest 消息汇总了多少条原始消息。
+	DigestCount int       `json:"digest_count,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// EnqueueStatus 是消息入队的结果类型，会作为 POST /v1/messages 的 status 返回。
+type EnqueueStatus string
+
+const (
+	// EnqueueQueued 表示消息已落库并创建了投递记录。
+	EnqueueQueued EnqueueStatus = "queued"
+	// EnqueueDeduped 表示命中去重窗口，没有产生新的投递，只累加了合并次数。
+	EnqueueDeduped EnqueueStatus = "deduped"
+	// EnqueueAggregated 表示 info 消息进入聚合窗口，等 digest 生成后统一投递。
+	EnqueueAggregated EnqueueStatus = "aggregated"
+)
+
+// EnqueueResult 是一次入队的结果。
+//
+// 去重命中时 MessageID 是原消息的 ID，Merged 是累计合并次数；
+// 聚合时 MessageID 是这条消息自己的 ID（稍后 aggregated_into 会指向 digest），
+// 两种情况都不会有新的 Deliveries。
+type EnqueueResult struct {
+	MessageID  string
+	Status     EnqueueStatus
+	Merged     int
+	Route      *Route
+	Deliveries []*Delivery
 }
 
 // DeliveryStatus 是单条渠道投递的状态。

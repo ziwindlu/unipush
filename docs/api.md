@@ -1,4 +1,4 @@
-# HTTP 接口说明（M1 + M2 路由）
+# HTTP 接口说明（M1 + M2 路由 + M3 去重聚合）
 
 所有 `/v1/*` 接口要求 `Authorization: Bearer <token>`，token 来自 `UNIPUSH_AUTH_TOKEN`（可配置多个）。错误响应体统一为：
 
@@ -41,12 +41,49 @@ curl -sS -X POST http://127.0.0.1:8080/v1/messages \
 
 同时返回 `Location: /v1/messages/{id}`。不传 `targets` 时由 `config.yaml` 的 `routing` 规则决定投递渠道，`route.mode` 为 `rule` 或 `default`，详见 [routing.md](routing.md)。
 
+### 入队状态
+
+`status` 不只有 `queued`：带 `dedupe_key` 的重复消息、`info` 级消息会分别返回 `deduped` / `aggregated`。
+两种情况都不会立刻产生投递记录，`Location` 指向的 ID 同样可以查询。
+
+| status | 含义 | 响应里额外字段 |
+| --- | --- | --- |
+| `queued` | 已落库并创建了每个渠道的投递记录 | `deliveries` |
+| `deduped` | 命中去重窗口，合并到原消息，没有新投递 | `merged`（累计合并次数）、`id` 是原消息 ID |
+| `aggregated` | `info` 消息进入聚合窗口，等 digest 生成后统一投递 | `id` 是自己的消息 ID，`deliveries` 为空 |
+
+命中去重（同一 `dedupe_key` 第 2 次及以后）：
+
+```json
+{
+  "id": "msg_3f6f...",
+  "status": "deduped",
+  "merged": 1,
+  "created_at": "2026-01-01T08:00:00Z",
+  "route": {"mode": "rule", "rule": "nas-alerts", "groups": ["phone"], "channels": ["bark"]},
+  "deliveries": []
+}
+```
+
+进入聚合窗口：
+
+```json
+{
+  "id": "msg_9a1c...",
+  "status": "aggregated",
+  "created_at": "2026-01-01T08:01:00Z",
+  "route": {"mode": "rule", "rule": "ci-build", "groups": ["team"], "channels": ["dingtalk"]},
+  "deliveries": []
+}
+```
+
 字段约束：
 
 - `title` 与 `body` 至少一个非空；`title` ≤200 字符，`body` ≤8000 字符
 - `level` ∈ `info`（缺省）/ `warn` / `error`
 - `source` 供路由规则匹配（≤64 字符）
 - `targets` 是显式投递目标：渠道组名（如 `phone` / `team`）或渠道名，只能引用启动时已启用的组/渠道；省略则按路由规则决定
+- `dedupe_key`：同一 key 在 `dedupe.window` 内只投递一次，其余只累加 `merged_count`
 - `link` 必须是 http(s) 绝对地址
 - 请求体上限由 `server.max_body_bytes` 控制（默认 1 MiB）
 
@@ -110,7 +147,8 @@ curl -sS http://127.0.0.1:8080/v1/messages/msg_3f6f... \
 
 | 值 | 含义 |
 | --- | --- |
-| `queued` | 没有投递记录（理论边界） |
+| `queued` | 还没有投递记录（理论边界） |
+| `aggregated` | 这条是已汇入 digest 的原始 info 消息，本身不再有投递 |
 | `in_progress` | 至少一个渠道仍在排队或发送中 |
 | `succeeded` | 所有渠道成功 |
 | `partial` | 部分成功、部分最终失败 |
@@ -126,6 +164,25 @@ curl -sS http://127.0.0.1:8080/v1/messages/msg_3f6f... \
 | `rule` | 命中的规则名；默认目标为 `default`；显式指定时省略 |
 | `groups` | 命中的渠道组（按配置顺序）；显式指定渠道名时为空 |
 | `channels` | 最终投递的渠道（去重排序） |
+
+`message` 上还有三个 M3 字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `merged_count` | 这条消息的 `dedupe_key` 被合并掉的次数（去重命中时累加） |
+| `aggregated_into` | 这条 info 消息被汇总进哪条 digest（digest 消息本身没有） |
+| `digest_count` | 这条 digest 汇总了多少条原始消息 |
+
+digest 消息的响应里另有 `aggregated_ids`，列出被汇总的原始消息 ID：
+
+```json
+{
+  "message": {"id": "msg_digest...", "title": "3 条 backup 汇总", "level": "info", "digest_count": 3, "...": "..."},
+  "status": "in_progress",
+  "deliveries": [{"channel": "bark", "status": "pending"}],
+  "aggregated_ids": ["msg_a...", "msg_b...", "msg_c..."]
+}
+```
 
 每条 delivery 的 `rule` / `groups` 说明该渠道是被哪条规则、哪些组带进来的；fan-out 时 `groups` 可能有多个。升级前的老消息没有 `route` 字段。
 

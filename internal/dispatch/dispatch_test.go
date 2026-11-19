@@ -399,10 +399,11 @@ func TestRoutingSelectsChannelsBySource(t *testing.T) {
 		channel.Set{"bark": bark, "dingtalk": dingtalk}, testRouter(t), fastConfig())
 
 	nas := routedMessage("nas-monitor", model.LevelError)
-	deliveries, err := h.disp.Enqueue(context.Background(), nas)
+	res, err := h.disp.Enqueue(context.Background(), nas)
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
+	deliveries := res.Deliveries
 	if len(deliveries) != 1 || deliveries[0].Channel != "bark" {
 		t.Fatalf("nas 告警应只投 bark，实际 %+v", deliveries)
 	}
@@ -432,10 +433,11 @@ func TestRoutingSelectsChannelsBySource(t *testing.T) {
 	}
 
 	ci := routedMessage("ci", model.LevelInfo)
-	deliveries, err = h.disp.Enqueue(context.Background(), ci)
+	res, err = h.disp.Enqueue(context.Background(), ci)
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
+	deliveries = res.Deliveries
 	if len(deliveries) != 1 || deliveries[0].Channel != "dingtalk" {
 		t.Fatalf("ci 信息应只投 dingtalk，实际 %+v", deliveries)
 	}
@@ -452,10 +454,11 @@ func TestRoutingExplicitTargetsOverrideRules(t *testing.T) {
 
 	// 来源规则本该投 phone，显式 targets 指向 team 后覆盖规则。
 	msg := routedMessage("nas-monitor", model.LevelError, "team")
-	deliveries, err := h.disp.Enqueue(context.Background(), msg)
+	res, err := h.disp.Enqueue(context.Background(), msg)
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
+	deliveries := res.Deliveries
 	if len(deliveries) != 1 || deliveries[0].Channel != "dingtalk" {
 		t.Fatalf("显式 targets 应覆盖规则，实际 %+v", deliveries)
 	}
