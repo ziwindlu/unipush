@@ -10,15 +10,18 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/ziwindlu/unipush/internal/routing"
 )
 
 // Config 是服务完整配置。
 type Config struct {
-	Server   Server   `yaml:"server"`
-	Auth     Auth     `yaml:"auth"`
-	Database Database `yaml:"database"`
-	Dispatch Dispatch `yaml:"dispatch"`
-	Channels Channels `yaml:"channels"`
+	Server   Server         `yaml:"server"`
+	Auth     Auth           `yaml:"auth"`
+	Database Database       `yaml:"database"`
+	Dispatch Dispatch       `yaml:"dispatch"`
+	Channels Channels       `yaml:"channels"`
+	Routing  routing.Config `yaml:"routing"`
 
 	// Warnings 记录加载过程中被降级处理的配置（例如渠道凭据缺失）。
 	Warnings []string `yaml:"-"`

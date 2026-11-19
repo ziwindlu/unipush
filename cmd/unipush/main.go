@@ -18,6 +18,7 @@ import (
 	"github.com/ziwindlu/unipush/internal/channel/dingtalk"
 	"github.com/ziwindlu/unipush/internal/config"
 	"github.com/ziwindlu/unipush/internal/dispatch"
+	"github.com/ziwindlu/unipush/internal/routing"
 	"github.com/ziwindlu/unipush/internal/store"
 )
 
@@ -46,14 +47,19 @@ func run() error {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+	return serve(*configPath, logger)
+}
 
+// serve 加载配置、组装依赖并阻塞到收到退出信号。
+// 配置有误（例如路由引用了不存在的渠道组）会在开始监听之前返回错误。
+func serve(configPath string, logger *slog.Logger) error {
 	if n, err := config.LoadDotEnv(".env"); err != nil {
 		logger.Warn("加载 .env 失败", "error", err)
 	} else if n > 0 {
 		logger.Info("已从 .env 加载环境变量", "count", n)
 	}
 
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
 	}
@@ -69,6 +75,14 @@ func run() error {
 		return err
 	}
 
+	router, err := buildRouter(cfg, senders)
+	if err != nil {
+		return err
+	}
+	for _, warning := range router.Warnings() {
+		logger.Warn(warning)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -78,7 +92,7 @@ func run() error {
 	}
 	defer st.Close()
 
-	dispatcher := dispatch.New(st, senders, dispatch.Config{
+	dispatcher := dispatch.New(st, senders, router, dispatch.Config{
 		Workers:        cfg.Dispatch.Workers,
 		PollInterval:   cfg.Dispatch.PollInterval,
 		Lease:          cfg.Dispatch.Lease,
@@ -123,6 +137,7 @@ func run() error {
 		"addr", cfg.Server.Addr,
 		"database", cfg.Database.Path,
 		"channels", dispatcher.Channels(),
+		"groups", dispatcher.Groups(),
 	)
 
 	select {
@@ -182,4 +197,12 @@ func buildSenders(cfg *config.Config, logger *slog.Logger) (channel.Set, error) 
 		logger.Warn("没有启用任何渠道，消息入口会返回 503，直到配置至少一个渠道")
 	}
 	return senders, nil
+}
+
+// buildRouter 校验并编译路由配置。引用不存在的渠道组 / 渠道会让启动直接失败。
+func buildRouter(cfg *config.Config, senders channel.Set) (*routing.Router, error) {
+	return routing.New(cfg.Routing, routing.Options{
+		SupportedChannels: channel.Known(),
+		EnabledChannels:   senders.Names(),
+	})
 }

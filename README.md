@@ -10,7 +10,7 @@
 
 ## 状态
 
-M1 已完成：单一入口 + Bearer 鉴权、Bark / 钉钉（含加签）适配器、SQLite（WAL）落盘队列、指数退避重试、投递状态查询、优雅退出。路由规则（M2）、更多渠道与去重聚合（M3）、Docker/CLI/部署文档（M4）在后续任务中实现。
+M2 已完成：在 M1（单一入口 + Bearer 鉴权、Bark / 钉钉适配器、SQLite 落盘队列、指数退避重试、投递状态查询、优雅退出）之上加了**渠道组与投递规则**——按来源/级别决定发到哪里，调用方不改代码；显式 `targets` 可覆盖规则；配置写错（未知组 / 未知渠道）启动即失败；路由结果随消息与投递记录落库，可查「为什么发到了这里」。更多渠道与去重聚合（M3）、Docker/CLI/部署文档（M4）在后续任务中实现。
 
 ## 快速开始
 
@@ -39,19 +39,21 @@ curl -sS -X POST http://127.0.0.1:8080/v1/messages \
   }'
 ```
 
-返回 `202 Accepted`，同时生成 Bark 和钉钉两条投递记录：
+返回 `202 Accepted`。`config.yaml` 里 `ci` + `warn` 命中规则 `ci-build` → 组 `team`，所以只排队到钉钉；响应里的 `route` 说明这次为什么发到这里：
 
 ```json
 {
   "id": "msg_...",
   "status": "queued",
   "created_at": "2026-01-01T00:00:00Z",
+  "route": {"mode": "rule", "rule": "ci-build", "groups": ["team"], "channels": ["dingtalk"]},
   "deliveries": [
-    {"id": "dlv_...", "channel": "bark", "status": "pending"},
-    {"id": "dlv_...", "channel": "dingtalk", "status": "pending"}
+    {"id": "dlv_...", "channel": "dingtalk", "status": "pending", "groups": ["team"]}
   ]
 }
 ```
+
+想同时发到手机就在请求里加 `"targets": ["all"]`（显式 targets 覆盖规则）。路由规则与配置写法见 [docs/routing.md](docs/routing.md)。
 
 查询投递结果：
 
@@ -76,8 +78,8 @@ curl -sS http://127.0.0.1:8080/v1/messages/msg_... -H "Authorization: Bearer $UN
 | `title` | 与 `body` 至少一个 | 标题，≤200 字符 |
 | `body` | 与 `title` 至少一个 | 正文，≤8000 字符 |
 | `level` | 否 | `info`（默认）/ `warn` / `error` |
-| `source` | 否 | 来源标识，供后续路由使用 |
-| `targets` | 否 | 渠道名列表（当前为 `bark` / `dingtalk`）；不传表示全部启用渠道 |
+| `source` | 否 | 来源标识，路由规则按它匹配（例如 `ci`、`nas-monitor`） |
+| `targets` | 否 | 显式指定投递目标：渠道组名（如 `phone`、`team`）或渠道名；不传则按路由规则决定 |
 | `dedupe_key` | 否 | 去重键，M1 先记录，M3 实现合并 |
 | `link` | 否 | http(s) 链接，Bark 可点击打开 |
 | `extra` | 否 | 任意附加字段，原样保存 |
@@ -94,6 +96,7 @@ curl -sS http://127.0.0.1:8080/v1/messages/msg_... -H "Authorization: Bearer $UN
 - **每渠道独立重试**：失败按 `base_backoff * 2^(attempts-1)` 退避，封顶 `max_backoff`，达到 `max_attempts` 后标记 `failed`。鉴权失败、device key 错误等不可重试错误立即失败，不浪费重试。
 - **重启不重不发**：启动时把上次处于 `sending` 的投递重新入队；已 `succeeded` 的渠道不会再次发送。
 - **渠道隔离**：单个渠道失败或超时不影响其他渠道。
+- **路由可解释**：每次投递都记录命中的规则与渠道组（`route` / `delivery.rule` / `delivery.groups`），排障不用猜；路由配置错误在启动时暴露，不会静默丢消息。
 
 ## 配置
 
@@ -108,6 +111,8 @@ DINGTALK_SECRET=           # 钉钉加签 secret（未开启加签可留空）
 
 常用配置项见 `config.yaml` 注释；数据库路径、worker 数量、重试次数、退避上下限、请求超时都可调。
 
+`routing` 段定义渠道组与投递规则，是「消息发到哪」的唯一来源，完整说明见 [docs/routing.md](docs/routing.md)。
+
 ## 测试
 
 ```bash
@@ -117,8 +122,9 @@ go test -race ./...
 
 - `internal/channel/bark` / `internal/channel/dingtalk`：基于 `httptest` 验证请求体、Bark 级别映射、钉钉 HMAC-SHA256 加签、错误分类（可重试 / 不可重试）
 - `internal/store`：落库、到期认领、租约、重启恢复、状态回写
-- `internal/dispatch`：多渠道路由、重试后成功、重试耗尽、永久失败、断网恢复、重启不重复发送
-- `internal/api`：401 / 400 / 413 / 503、字段归一化、查询聚合状态，以及一条消息同时打到 Bark 和钉钉 mock 的端到端用例
+- `internal/routing`：按来源/级别命中规则、默认目标、显式 targets 覆盖、fan-out 去重、禁用渠道过滤，以及未知组 / 未知渠道 / 非法级别的启动校验
+- `internal/dispatch`：多渠道路由、按规则选渠道、显式覆盖、重试后成功、重试耗尽、永久失败、断网恢复、重启不重复发送
+- `internal/api`：401 / 400 / 413 / 503、字段归一化、查询聚合状态，以及两条端到端用例（同时打到 Bark + 钉钉；按来源路由 / 显式覆盖 / 查询路由结果）
 
 ## 目录
 
@@ -128,9 +134,10 @@ internal/api/       # HTTP 接口与鉴权
 internal/channel/   # 渠道适配器契约（bark/、dingtalk/）
 internal/config/    # YAML + .env 加载与校验
 internal/dispatch/  # 投递 worker、重试与退避
-internal/model/     # 消息与投递记录模型
+internal/model/     # 消息、投递记录与路由结果模型
+internal/routing/   # 渠道组与投递规则的编译、校验与解析
 internal/store/     # SQLite（WAL）存取与迁移
-docs/               # 接口说明
+docs/               # 接口与路由说明
 ```
 
 ## 里程碑
@@ -138,6 +145,6 @@ docs/               # 接口说明
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | M1 | 消息入口、Bark/钉钉适配器、SQLite outbox、重试 | ✅ 已完成 |
-| M2 | 渠道组与按来源/级别的路由规则 | 待开始 |
+| M2 | 渠道组与按来源/级别的路由规则 | ✅ 已完成 |
 | M3 | 飞书/企微/邮件/Webhook、去重与聚合 | 待开始 |
 | M4 | Docker、CLI、只读消息列表、部署文档 | 待开始 |

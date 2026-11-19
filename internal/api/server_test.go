@@ -45,11 +45,14 @@ func (f *fakeStore) Ping(ctx context.Context) error { return f.pingErr }
 type fakeQueue struct {
 	mu       sync.Mutex
 	channels []string
+	groups   []string
 	enqueued []*model.Message
 	err      error
 }
 
 func (f *fakeQueue) Channels() []string { return f.channels }
+
+func (f *fakeQueue) Groups() []string { return f.groups }
 
 func (f *fakeQueue) Enqueue(ctx context.Context, msg *model.Message) ([]*model.Delivery, error) {
 	if f.err != nil {

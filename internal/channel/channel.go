@@ -24,6 +24,10 @@ type Sender interface {
 // Set 是渠道名到适配器的映射。
 type Set map[string]Sender
 
+// Known 返回当前版本支持的全部渠道名（无论本次运行是否启用）。
+// 路由配置里引用这个集合之外的渠道名会在启动时报错。
+func Known() []string { return []string{"bark", "dingtalk"} }
+
 // Names 返回排好序的渠道名，保证投递顺序和接口输出稳定。
 func (s Set) Names() []string {
 	names := make([]string, 0, len(s))
