@@ -1,6 +1,6 @@
 # unipush
 
-个人统一消息推送平台。任何脚本、服务、设备都只调用**一个** HTTP 接口，由平台按规则投递到 Bark、钉钉等渠道，带落盘队列、失败重试和完整投递记录。
+个人统一消息推送平台。任何脚本、服务、设备都只调用**一个** HTTP 接口，由平台按规则投递到 Bark、钉钉等渠道，带落盘队列、失败重试和完整投递记录。附一个内嵌在二进制里的 Web 控制台，支持多用户登录、消息查看 / 发送和 API Token 管理。
 
 ## 解决什么
 
@@ -10,7 +10,7 @@
 
 ## 状态
 
-M1–M4 已全部落地：单一入口 + Bearer 鉴权、Bark / 钉钉 / 飞书 / 企业微信 / 邮件 / 通用 webhook 六个渠道、渠道组与按来源/级别的路由、SQLite 落盘队列与指数退避重试、去重与聚合，以及面向长期运行的 **`push` 命令行、只读消息列表、Docker、结构化日志和部署文档**。
+M1–M5 已全部落地：单一入口 + Bearer 鉴权、Bark / 钉钉 / 飞书 / 企业微信 / 邮件 / 通用 webhook 六个渠道、渠道组与按来源/级别的路由、SQLite 落盘队列与指数退避重试、去重与聚合、`push` CLI、只读列表、Docker，以及**多用户 Web 控制台与可撤销的 API Token**。
 
 ## 快速开始
 
@@ -19,10 +19,15 @@ M1–M4 已全部落地：单一入口 + Bearer 鉴权、Bark / 钉钉 / 飞书 
 ```bash
 cp .env.example .env
 # 编辑 .env：至少填 UNIPUSH_AUTH_TOKEN；再填 BARK_DEVICE_KEY、DINGTALK_WEBHOOK、DINGTALK_SECRET
+# 可选：填 UNIPUSH_ADMIN_USER / UNIPUSH_ADMIN_PASSWORD；留空会生成随机管理员密码并打印一次
 go run ./cmd/unipush
 ```
 
-服务默认监听 `127.0.0.1:8080`，数据落在 `./data/unipush.db`。配置见 `config.yaml`，启动时会自动加载当前目录的 `.env`（已存在的环境变量优先）。
+服务默认监听 `127.0.0.1:8080`，数据落在 `./data/unipush.db`。浏览器打开 `http://127.0.0.1:8080` 即可进入 Web 控制台；首次启动的管理员账号与密码见启动日志（或 `.env` 里的 `UNIPUSH_ADMIN_USER` / `UNIPUSH_ADMIN_PASSWORD`）。配置见 `config.yaml`，启动时会自动加载当前目录的 `.env`（已存在的环境变量优先）。
+
+控制台里可以查看队列与历史消息、直接发送消息、为脚本创建 / 撤销 API Token，管理员还能创建多个登录用户。完整说明见 [docs/web.md](docs/web.md)。
+
+忘记密码时可以用 `./unipush -reset-password <用户名>` 离线重置（随机密码会打印到终端）。
 
 发一条消息：
 
@@ -96,6 +101,7 @@ curl -fsS http://127.0.0.1:8080/healthz
 | GET | `/v1/messages` | Bearer | 只读消息列表：游标分页，按来源/级别/状态过滤 |
 | GET | `/v1/messages/{id}` | Bearer | 查询消息与每个渠道的投递状态 |
 | GET | `/healthz` | 无 | 健康检查：数据库、版本、运行时长、队列统计 |
+| GET | `/`、`/app/*` | 会话 Cookie | Web 控制台：登录、消息、发送、Token、用户管理 |
 
 请求体字段：
 
@@ -132,6 +138,8 @@ curl -fsS http://127.0.0.1:8080/healthz
 
 ```bash
 UNIPUSH_AUTH_TOKEN=        # 调用方 Bearer Token，至少一个；不配置会生成随机临时 token 并打印到日志
+UNIPUSH_ADMIN_USER=        # 首次启动创建的管理员用户名，默认 admin
+UNIPUSH_ADMIN_PASSWORD=    # 初始管理员密码；留空随机生成并打印一次
 BARK_DEVICE_KEY=           # Bark 设备 key
 DINGTALK_WEBHOOK=          # 钉钉机器人 webhook（含 access_token）
 DINGTALK_SECRET=           # 钉钉加签 secret（未开启加签可留空）
@@ -176,6 +184,7 @@ go test -race ./...
 - `internal/dispatch`：多渠道路由、按规则选渠道、显式覆盖、重试后成功、重试耗尽、永久失败、断网恢复、重启不重复发送；去重（同 key 连发 10 次只投 1 次、窗口过期后重投）与聚合（窗口到期 / 攒够条数才发 digest、error 不聚合、不同 targets 不混桶）
 - `internal/api`：401 / 400 / 413 / 503、字段归一化、查询聚合状态、列表过滤与游标分页、健康检查字段，以及端到端用例（同时打到 Bark + 钉钉；按来源路由 / 显式覆盖 / 查询路由结果）
 - `internal/store`：消息列表的排序、来源/级别/状态过滤、keyset 分页与投递统计
+- `internal/auth` / `internal/web`：bcrypt 密码、随机 Token 与哈希、会话过期、登录限流、CSRF、管理员引导、用户增改停用、Token 创建 / 撤销 / 动态鉴权，以及控制台页面渲染冒烟
 - `cmd/push`：CLI 参数校验、请求体、退出码、`--quiet` / `--json` / stdin 正文
 
 ## 目录
@@ -184,12 +193,15 @@ go test -race ./...
 cmd/unipush/        # 服务入口与优雅退出
 cmd/push/           # 命令行客户端（脚本 / cron）
 internal/api/       # HTTP 接口与鉴权
+internal/auth/      # 密码哈希、会话与 API Token 原语
 internal/channel/   # 渠道适配器契约与实现（bark/、dingtalk/、feishu/、wecom/、email/、webhook/）
 internal/config/    # YAML + .env 加载与校验
 internal/dispatch/  # 投递 worker、重试与退避
+internal/ingest/    # 请求归一化与校验（API 与 Web 共用）
 internal/model/     # 消息、投递记录与路由结果模型
 internal/routing/   # 渠道组与投递规则的编译、校验与解析
 internal/store/     # SQLite（WAL）存取、迁移与列表查询
+internal/web/       # Web 控制台：登录、消息、发送、Token、用户管理（模板与静态资源内嵌）
 docs/               # 接口、路由、渠道与部署文档
 Dockerfile          # 多阶段构建，最终镜像只含二进制与配置
 docker-compose.yml  # 本机常驻样例（SQLite 挂载、健康检查、日志轮转）
@@ -203,3 +215,4 @@ docker-compose.yml  # 本机常驻样例（SQLite 挂载、健康检查、日志
 | M2 | 渠道组与按来源/级别的路由规则 | ✅ 已完成 |
 | M3 | 飞书/企微/邮件/Webhook、去重与聚合 | ✅ 已完成 |
 | M4 | Docker、CLI、只读消息列表、部署文档 | ✅ 已完成 |
+| M5 | 多用户 Web 控制台、API Token、用户与密码管理 | ✅ 已完成 |

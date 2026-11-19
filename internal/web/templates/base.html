@@ -1,0 +1,70 @@
+{{define "base"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>{{.Title}} · unipush</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+{{if .User}}
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="/app"><span class="brand-mark">u</span><span>unipush</span></a>
+      <nav class="nav">
+        <a class="nav-link{{if eq .Active "dashboard"}} active{{end}}" href="/app">概览</a>
+        <a class="nav-link{{if eq .Active "messages"}} active{{end}}" href="/app/messages">消息记录</a>
+        <a class="nav-link{{if eq .Active "send"}} active{{end}}" href="/app/send">发送消息</a>
+        <a class="nav-link{{if eq .Active "tokens"}} active{{end}}" href="/app/tokens">API Token</a>
+        {{if .User.IsAdmin}}<a class="nav-link{{if eq .Active "users"}} active{{end}}" href="/app/users">用户</a>{{end}}
+        <a class="nav-link{{if eq .Active "account"}} active{{end}}" href="/app/account">账户</a>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="dot"></span> 服务运行中
+        <span class="version">v{{.Version}}</span>
+      </div>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <h1>{{.Title}}</h1>
+        <div class="userbox">
+          <span class="user-name">{{defaultText .User.DisplayName .User.Username}}</span>
+          <span class="role-tag">{{if .User.IsAdmin}}管理员{{else}}成员{{end}}</span>
+          <form method="post" action="/logout" class="inline-form">
+            <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+            <button type="submit" class="btn btn-ghost btn-sm">退出</button>
+          </form>
+        </div>
+      </header>
+
+      {{template "flash" .}}
+      {{template "content" .}}
+
+      <footer class="page-foot">unipush · 统一消息推送平台</footer>
+    </main>
+  </div>
+{{else}}
+  <main class="guest-main">
+    {{template "flash" .}}
+    {{template "content" .}}
+  </main>
+{{end}}
+<script src="/static/app.js" defer></script>
+</body>
+</html>{{end}}
+
+{{define "flash"}}
+{{with .Flash}}
+<div class="flash flash-{{.Kind}}" role="status">
+  <p class="flash-text">{{.Text}}</p>
+  {{if .Secret}}
+  <div class="secret-row">
+    <span class="secret-label">{{.SecretLabel}}</span>
+    <code class="secret" data-secret>{{.Secret}}</code>
+    <button type="button" class="btn btn-sm" data-copy="{{.Secret}}">复制</button>
+  </div>
+  {{end}}
+</div>
+{{end}}
+{{end}}

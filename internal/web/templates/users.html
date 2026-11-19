@@ -1,0 +1,70 @@
+{{define "content"}}
+<section class="card">
+  <header class="card-head">
+    <h2>新增用户</h2>
+    <span class="muted">管理员可以创建账号、重置密码和停用账号</span>
+  </header>
+  <form method="post" action="/app/users" class="form-grid">
+    <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+    <label class="field">
+      <span>用户名</span>
+      <input type="text" name="username" required pattern="[a-z0-9][a-z0-9._-]{2,31}" placeholder="例如 alice">
+    </label>
+    <label class="field">
+      <span>显示名（可选）</span>
+      <input type="text" name="display_name" maxlength="40" placeholder="例如 运维">
+    </label>
+    <label class="field">
+      <span>角色</span>
+      <select name="role">
+        <option value="member">成员</option>
+        <option value="admin">管理员</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>初始密码（可选）</span>
+      <input type="text" name="password" minlength="8" autocomplete="new-password" placeholder="留空自动生成">
+    </label>
+    <div class="form-actions field-wide">
+      <button type="submit" class="btn btn-primary">创建用户</button>
+    </div>
+  </form>
+</section>
+
+<section class="card">
+  <header class="card-head"><h2>全部用户</h2></header>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>用户名</th><th>显示名</th><th>角色</th><th>状态</th><th>最近登录</th><th>创建时间</th><th></th></tr>
+      </thead>
+      <tbody>
+      {{$currentID := .Data.CurrentUserID}}
+      {{range .Data.Users}}
+        <tr>
+          <td><strong>{{.Username}}</strong></td>
+          <td class="muted">{{defaultText .DisplayName "-"}}</td>
+          <td>{{if eq .Role "admin"}}<span class="chip chip-warn">管理员</span>{{else}}<span class="chip">成员</span>{{end}}</td>
+          <td>{{if .Disabled}}<span class="chip chip-bad">已停用</span>{{else}}<span class="chip chip-ok">启用</span>{{end}}</td>
+          <td class="muted nowrap">{{fmtTimePtr .LastLoginAt}}</td>
+          <td class="muted nowrap">{{fmtTime .CreatedAt}}</td>
+          <td class="right nowrap">
+            <form method="post" action="/app/users/{{.ID}}/password" class="inline-form" data-confirm="生成新的随机密码？该用户当前登录会立即失效。">
+              <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+              <button type="submit" class="btn btn-ghost btn-sm">重置密码</button>
+            </form>
+            {{if ne .ID $currentID}}
+            <form method="post" action="/app/users/{{.ID}}/status" class="inline-form" data-confirm="{{if .Disabled}}启用该用户？{{else}}停用该用户？其登录会话和 API Token 会立即失效。{{end}}">
+              <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+              <input type="hidden" name="action" value="{{if .Disabled}}enable{{else}}disable{{end}}">
+              <button type="submit" class="btn btn-ghost btn-sm">{{if .Disabled}}启用{{else}}停用{{end}}</button>
+            </form>
+            {{end}}
+          </td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+</section>
+{{end}}

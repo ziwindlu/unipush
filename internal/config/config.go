@@ -23,6 +23,7 @@ type Config struct {
 	Dispatch    Dispatch       `yaml:"dispatch"`
 	Channels    Channels       `yaml:"channels"`
 	Routing     routing.Config `yaml:"routing"`
+	Web         Web            `yaml:"web"`
 	Dedupe      Dedupe         `yaml:"dedupe"`
 	Aggregation Aggregation    `yaml:"aggregation"`
 	Log         Log            `yaml:"log"`
@@ -46,6 +47,17 @@ type Server struct {
 // Auth 是调用方鉴权配置。
 type Auth struct {
 	Tokens []string `yaml:"tokens"`
+}
+
+// Web 是 Web 控制台配置。
+type Web struct {
+	// Enabled 关闭后只提供 /v1 API 与 /healthz，不注册 Web 控制台路由。
+	Enabled bool `yaml:"enabled"`
+	// AdminUser / AdminPassword 只在数据库里还没有任何用户时用于创建初始管理员；
+	// 密码留空时会随机生成并打印到启动日志一次。
+	AdminUser     string        `yaml:"admin_user"`
+	AdminPassword string        `yaml:"admin_password"`
+	SessionTTL    time.Duration `yaml:"session_ttl"`
 }
 
 // Database 是 SQLite 配置。
@@ -202,6 +214,7 @@ func Default() *Config {
 				ContentType: "application/json; charset=utf-8",
 			},
 		},
+		Web:         Web{Enabled: true, AdminUser: "admin", SessionTTL: 7 * 24 * time.Hour},
 		Dedupe:      Dedupe{Enabled: true, Window: 5 * time.Minute},
 		Aggregation: Aggregation{Enabled: true, Window: time.Minute, MaxItems: 50},
 		Log:         Log{Format: "text", Level: "info"},
@@ -356,6 +369,22 @@ func (c *Config) normalize() {
 		c.Log.Level = "info"
 	}
 
+	// 管理员初始账号优先取环境变量，避免密码里的特殊字符参与 YAML 解析。
+	if v := strings.TrimSpace(os.Getenv("UNIPUSH_ADMIN_USER")); v != "" {
+		c.Web.AdminUser = v
+	}
+	if v := strings.TrimSpace(os.Getenv("UNIPUSH_ADMIN_PASSWORD")); v != "" {
+		c.Web.AdminPassword = v
+	}
+	c.Web.AdminUser = strings.TrimSpace(c.Web.AdminUser)
+	if c.Web.AdminUser == "" {
+		c.Web.AdminUser = "admin"
+	}
+	c.Web.AdminPassword = strings.TrimSpace(c.Web.AdminPassword)
+	if c.Web.SessionTTL <= 0 {
+		c.Web.SessionTTL = 7 * 24 * time.Hour
+	}
+
 	tokens := make([]string, 0, len(c.Auth.Tokens))
 	for _, t := range c.Auth.Tokens {
 		if t = strings.TrimSpace(t); t != "" {
@@ -472,6 +501,14 @@ func (c *Config) validate() error {
 	case "debug", "info", "warn", "error":
 	default:
 		return fmt.Errorf("log.level 只能是 debug / info / warn / error，当前是 %q", c.Log.Level)
+	}
+	if c.Web.Enabled {
+		if c.Web.SessionTTL <= 0 {
+			return fmt.Errorf("web.session_ttl 必须大于 0")
+		}
+		if len(c.Web.AdminPassword) > 0 && len(c.Web.AdminPassword) < 8 {
+			return fmt.Errorf("web.admin_password 至少 8 个字符")
+		}
 	}
 	return nil
 }

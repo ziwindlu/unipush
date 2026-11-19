@@ -1,6 +1,6 @@
-# HTTP 接口说明（M1 + M2 路由 + M3 去重聚合 + M4 列表）
+# HTTP 接口说明（M1 + M2 路由 + M3 去重聚合 + M4 列表 + M5 Web Token）
 
-所有 `/v1/*` 接口要求 `Authorization: Bearer <token>`，token 来自 `UNIPUSH_AUTH_TOKEN`（可配置多个）。错误响应体统一为：
+所有 `/v1/*` 接口要求 `Authorization: Bearer <token>`。token 可以来自 `config.yaml` 的 `auth.tokens`（`UNIPUSH_AUTH_TOKEN` 等），也可以在 Web 控制台的「API Token」页创建；两者权限相同。错误响应体统一为：
 
 ```json
 {"error": {"code": "invalid_request", "message": "人类可读的原因", "field": "出错字段（可选）"}}

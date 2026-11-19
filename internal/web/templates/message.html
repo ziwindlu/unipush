@@ -1,0 +1,81 @@
+{{define "content"}}
+<section class="card">
+  <header class="card-head">
+    <div>
+      <h2>{{defaultText .Data.Message.Title "（无标题）"}}</h2>
+      <p class="muted mono small">{{.Data.Message.ID}}</p>
+    </div>
+    <span class="{{statusClass .Data.Status}}">{{statusLabel .Data.Status}}</span>
+  </header>
+
+  <dl class="meta-grid">
+    <div><dt>级别</dt><dd><span class="level level-{{.Data.Message.Level}}">{{levelLabel .Data.Message.Level}}</span></dd></div>
+    <div><dt>来源</dt><dd>{{defaultText .Data.Message.Source "-"}}</dd></div>
+    <div><dt>创建时间</dt><dd>{{fmtTime .Data.Message.CreatedAt}}</dd></div>
+    <div><dt>合并次数</dt><dd>{{.Data.Message.MergedCount}}</dd></div>
+    {{if .Data.Message.DedupeKey}}<div><dt>去重键</dt><dd class="mono">{{.Data.Message.DedupeKey}}</dd></div>{{end}}
+    {{if .Data.Message.Link}}<div><dt>链接</dt><dd><a href="{{.Data.Message.Link}}" rel="noreferrer noopener" target="_blank">{{.Data.Message.Link}}</a></dd></div>{{end}}
+    {{if .Data.Message.DigestCount}}<div><dt>汇总条数</dt><dd>{{.Data.Message.DigestCount}}</dd></div>{{end}}
+    {{if .Data.Message.AggregatedInto}}<div><dt>已汇入</dt><dd><a class="mono" href="/app/messages/{{.Data.Message.AggregatedInto}}">{{.Data.Message.AggregatedInto}}</a></dd></div>{{end}}
+  </dl>
+
+  {{if .Data.Message.Body}}
+  <div class="body-block">{{.Data.Message.Body}}</div>
+  {{end}}
+
+  {{with .Data.Message.Route}}
+  <div class="route-box">
+    <h3>路由结果</h3>
+    <p>方式 <code>{{.Mode}}</code>{{if .Rule}} · 规则 <code>{{.Rule}}</code>{{end}}</p>
+    <p>渠道组：{{if .Groups}}{{range $i, $g := .Groups}}{{if $i}}、{{end}}<span class="tag tag-muted">{{$g}}</span>{{end}}{{else}}—{{end}}</p>
+    <p>投递渠道：{{range $i, $c := .Channels}}{{if $i}}、{{end}}<span class="tag">{{$c}}</span>{{end}}</p>
+  </div>
+  {{end}}
+</section>
+
+<section class="card">
+  <header class="card-head"><h2>投递明细</h2></header>
+  {{if .Data.Deliveries}}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>渠道</th><th>状态</th><th>尝试</th><th>命中规则</th><th>下次重试</th><th>最近错误</th></tr>
+      </thead>
+      <tbody>
+      {{range .Data.Deliveries}}
+        <tr>
+          <td><span class="tag">{{.Channel}}</span></td>
+          <td><span class="{{statusClass (printf "%s" .Status)}}">{{deliveryLabel (printf "%s" .Status)}}</span></td>
+          <td>{{.Attempts}} / {{.MaxAttempts}}</td>
+          <td class="muted">{{defaultText .Rule "-"}}</td>
+          <td class="muted nowrap">{{fmtTimePtr .NextAttemptAt}}</td>
+          <td class="error-text">{{defaultText .LastError "—"}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <p class="empty">{{if .Data.Message.AggregatedInto}}这条消息已汇入 digest，投递状态请查看 digest 消息。{{else}}暂无投递记录（消息可能仍在聚合窗口内）。{{end}}</p>
+  {{end}}
+</section>
+
+{{if .Data.AggregatedIDs}}
+<section class="card">
+  <header class="card-head"><h2>汇总的原始消息</h2></header>
+  <ul class="id-list">
+    {{range .Data.AggregatedIDs}}<li><a class="mono" href="/app/messages/{{.}}">{{.}}</a></li>{{end}}
+  </ul>
+</section>
+{{end}}
+
+<details class="card raw">
+  <summary>原始 JSON</summary>
+  <pre>{{.Data.RawJSON}}</pre>
+</details>
+
+<div class="page-actions">
+  <a class="btn btn-ghost" href="/app/messages">返回列表</a>
+  <a class="btn" href="/app/send">再发一条</a>
+</div>
+{{end}}

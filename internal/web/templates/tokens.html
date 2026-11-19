@@ -1,0 +1,63 @@
+{{define "content"}}
+<section class="card">
+  <header class="card-head">
+    <h2>创建 API Token</h2>
+    <span class="muted">用于脚本、cron 调用 <code>POST /v1/messages</code></span>
+  </header>
+  <form method="post" action="/app/tokens" class="inline-form-row">
+    <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+    <label class="field grow">
+      <span>用途名称</span>
+      <input type="text" name="name" maxlength="40" required placeholder="例如 ci-build、nas-monitor">
+    </label>
+    <button type="submit" class="btn btn-primary">生成 Token</button>
+  </form>
+  <p class="hint">Token 明文只展示一次，数据库只保存 SHA-256 哈希。泄露后请立即撤销并重新生成。</p>
+</section>
+
+<section class="card">
+  <header class="card-head"><h2>我的 Token</h2></header>
+  {{if .Data.Tokens}}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>名称</th><th>前缀</th><th>创建时间</th><th>最近使用</th><th>状态</th><th></th></tr>
+      </thead>
+      <tbody>
+      {{range .Data.Tokens}}
+        <tr>
+          <td>{{.Name}}</td>
+          <td class="mono">{{.Prefix}}</td>
+          <td class="muted nowrap">{{fmtTime .CreatedAt}}</td>
+          <td class="muted nowrap">{{fmtTimePtr .LastUsedAt}}</td>
+          <td>
+            {{if .RevokedAt}}<span class="chip chip-bad">已撤销</span>
+            {{else}}<span class="chip chip-ok">可用</span>{{end}}
+          </td>
+          <td class="right">
+            {{if not .RevokedAt}}
+            <form method="post" action="/app/tokens/{{.ID}}/revoke" class="inline-form" data-confirm="撤销后使用该 Token 的调用会立即返回 401，确认撤销？">
+              <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+              <button type="submit" class="btn btn-ghost btn-sm">撤销</button>
+            </form>
+            {{end}}
+          </td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <p class="empty">还没有 Token。创建一个，然后把下面的命令放进脚本里。</p>
+  {{end}}
+</section>
+
+<section class="card">
+  <header class="card-head"><h2>调用示例</h2></header>
+  <pre class="code-block">curl -sS -X POST http://127.0.0.1:8080/v1/messages \
+  -H "Authorization: Bearer &lt;你的 Token&gt;" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"部署完成","body":"v1.2.3 已上线","level":"warn","source":"ci"}'</pre>
+  <p class="hint">也可以直接用仓库里的 <code>push</code> CLI，或参考 <code>docs/api.md</code>。</p>
+</section>
+{{end}}

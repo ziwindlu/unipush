@@ -10,11 +10,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
-	"unicode/utf8"
 
+	"github.com/ziwindlu/unipush/internal/ingest"
 	"github.com/ziwindlu/unipush/internal/model"
 	"github.com/ziwindlu/unipush/internal/routing"
 	"github.com/ziwindlu/unipush/internal/store"
@@ -41,6 +40,9 @@ type Queue interface {
 type Config struct {
 	// AuthTokens 是允许的 Bearer Token 列表。
 	AuthTokens []string
+	// TokenVerifier 校验配置之外的动态 Token（Web 控制台创建）；
+	// 返回 true 表示放行。nil 表示只接受 AuthTokens。
+	TokenVerifier func(ctx context.Context, token string) (bool, error)
 	// MaxBodyBytes 是请求体大小上限。
 	MaxBodyBytes int64
 	// Version 会出现在 /healthz 里，方便确认线上跑的是哪个版本。
@@ -79,16 +81,7 @@ func New(cfg Config, st Store, queue Queue, logger *slog.Logger) *Server {
 func (s *Server) Handler() http.Handler { return s.withAccessLog(s.mux) }
 
 // createRequest 是 POST /v1/messages 的请求体。
-type createRequest struct {
-	Title     string         `json:"title"`
-	Body      string         `json:"body"`
-	Level     string         `json:"level"`
-	Source    string         `json:"source"`
-	Targets   []string       `json:"targets"`
-	DedupeKey string         `json:"dedupe_key"`
-	Link      string         `json:"link"`
-	Extra     map[string]any `json:"extra"`
-}
+type createRequest = ingest.Request
 
 type errorBody struct {
 	Error apiError `json:"error"`
@@ -123,9 +116,9 @@ func (s *Server) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg, verr := s.buildMessage(&req)
+	msg, verr := ingest.Build(&req, s.queue.Channels(), s.queue.Groups())
 	if verr != nil {
-		s.writeError(w, verr.status, verr.code, verr.message, verr.field)
+		s.writeError(w, verr.Status, verr.Code, verr.Message, verr.Field)
 		return
 	}
 
@@ -165,90 +158,6 @@ func (s *Server) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusAccepted, resp)
 }
 
-type validationError struct {
-	status  int
-	code    string
-	message string
-	field   string
-}
-
-func (s *Server) buildMessage(req *createRequest) (*model.Message, *validationError) {
-	title := strings.TrimSpace(req.Title)
-	body := strings.TrimSpace(req.Body)
-	if title == "" && body == "" {
-		return nil, &validationError{http.StatusBadRequest, "invalid_request", "title 与 body 不能同时为空", "title"}
-	}
-	if utf8.RuneCountInString(title) > 200 {
-		return nil, &validationError{http.StatusBadRequest, "invalid_request", "title 不能超过 200 个字符", "title"}
-	}
-	if utf8.RuneCountInString(body) > 8000 {
-		return nil, &validationError{http.StatusBadRequest, "invalid_request", "body 不能超过 8000 个字符", "body"}
-	}
-
-	level := strings.ToLower(strings.TrimSpace(req.Level))
-	if level == "" {
-		level = model.LevelInfo
-	}
-	if !model.ValidLevel(level) {
-		return nil, &validationError{http.StatusBadRequest, "invalid_request", "level 必须是 info / warn / error 之一", "level"}
-	}
-
-	source := strings.TrimSpace(req.Source)
-	if utf8.RuneCountInString(source) > 64 {
-		return nil, &validationError{http.StatusBadRequest, "invalid_request", "source 不能超过 64 个字符", "source"}
-	}
-	dedupeKey := strings.TrimSpace(req.DedupeKey)
-	if utf8.RuneCountInString(dedupeKey) > 256 {
-		return nil, &validationError{http.StatusBadRequest, "invalid_request", "dedupe_key 不能超过 256 个字符", "dedupe_key"}
-	}
-
-	link := strings.TrimSpace(req.Link)
-	if link != "" {
-		u, err := url.Parse(link)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return nil, &validationError{http.StatusBadRequest, "invalid_request", "link 必须是 http(s) 绝对地址", "link"}
-		}
-	}
-
-	targets := model.NormalizeTargets(req.Targets)
-	available := s.queue.Channels()
-	groups := s.queue.Groups()
-	if len(targets) > 0 {
-		known := make(map[string]struct{}, len(available)+len(groups))
-		for _, name := range groups {
-			known[name] = struct{}{}
-		}
-		for _, name := range available {
-			known[name] = struct{}{}
-		}
-		for _, name := range targets {
-			if _, ok := known[name]; !ok {
-				return nil, &validationError{
-					http.StatusBadRequest, "invalid_request",
-					fmt.Sprintf("未知投递目标 %q（可用渠道组: %s；可用渠道: %s）",
-						name, joinNames(groups), joinNames(available)),
-					"targets",
-				}
-			}
-		}
-	} else if len(available) == 0 {
-		return nil, &validationError{http.StatusServiceUnavailable, "no_channels", "服务未配置任何可用渠道", "targets"}
-	}
-
-	return &model.Message{
-		ID:        model.NewID("msg_"),
-		Title:     title,
-		Body:      body,
-		Level:     level,
-		Source:    source,
-		Targets:   targets,
-		DedupeKey: dedupeKey,
-		Link:      link,
-		Extra:     req.Extra,
-		CreatedAt: time.Now().UTC(),
-	}, nil
-}
-
 type createResponse struct {
 	ID string `json:"id"`
 	// Status 是入队结果：queued（已排投递）/ deduped（命中去重）/ aggregated（进入聚合窗口）。
@@ -282,13 +191,6 @@ func (s *Server) writeEnqueueError(w http.ResponseWriter, messageID string, err 
 	}
 	s.log.Error("消息入队失败", "error", err, "message_id", messageID)
 	s.writeError(w, http.StatusInternalServerError, "enqueue_failed", "消息入队失败: "+err.Error(), "")
-}
-
-func joinNames(names []string) string {
-	if len(names) == 0 {
-		return "（无）"
-	}
-	return strings.Join(names, ", ")
 }
 
 func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
@@ -408,6 +310,16 @@ func (s *Server) authorized(r *http.Request) bool {
 	}
 	for _, want := range s.cfg.AuthTokens {
 		if subtle.ConstantTimeCompare([]byte(token), []byte(want)) == 1 {
+			return true
+		}
+	}
+	if s.cfg.TokenVerifier != nil {
+		ok, err := s.cfg.TokenVerifier(r.Context(), token)
+		if err != nil {
+			s.log.Error("校验动态 Token 失败", "error", err)
+			return false
+		}
+		if ok {
 			return true
 		}
 	}

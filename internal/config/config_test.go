@@ -299,6 +299,26 @@ func TestLoadRejectsInvalidM3Settings(t *testing.T) {
 }
 
 // TestLoadLogDefaultsAndOverrides 覆盖 M4：日志格式/级别既能在配置文件里写，也能用环境变量覆盖。
+func TestLoadWebDefaultsAndAdminEnv(t *testing.T) {
+	t.Setenv("UNIPUSH_ADMIN_USER", "ops")
+	// 密码里的冒号和井号不能参与 YAML 解析，必须直接从环境变量读取。
+	t.Setenv("UNIPUSH_ADMIN_PASSWORD", "p@ss: word#1")
+	path := writeConfig(t, "auth:\n  tokens: [test-token]\n")
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Web.Enabled {
+		t.Error("Web 控制台默认应启用")
+	}
+	if cfg.Web.AdminUser != "ops" || cfg.Web.AdminPassword != "p@ss: word#1" {
+		t.Fatalf("管理员环境变量未生效: %+v", cfg.Web)
+	}
+	if cfg.Web.SessionTTL != 168*time.Hour {
+		t.Errorf("session_ttl 默认值 = %v", cfg.Web.SessionTTL)
+	}
+}
+
 func TestLoadLogDefaultsAndOverrides(t *testing.T) {
 	path := writeConfig(t, `
 auth:

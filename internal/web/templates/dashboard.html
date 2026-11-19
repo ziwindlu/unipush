@@ -1,0 +1,83 @@
+{{define "content"}}
+<section class="stats">
+  <article class="stat">
+    <span class="stat-label">等待投递</span>
+    <strong class="stat-value">{{.Data.Stats.Pending}}</strong>
+    <span class="stat-hint">含失败待重试</span>
+  </article>
+  <article class="stat">
+    <span class="stat-label">正在发送</span>
+    <strong class="stat-value">{{.Data.Stats.Sending}}</strong>
+    <span class="stat-hint">已认领，等待回写</span>
+  </article>
+  <article class="stat">
+    <span class="stat-label">已送达</span>
+    <strong class="stat-value">{{.Data.Stats.Succeeded}}</strong>
+    <span class="stat-hint">累计成功投递</span>
+  </article>
+  <article class="stat">
+    <span class="stat-label">最终失败</span>
+    <strong class="stat-value">{{.Data.Stats.Failed}}</strong>
+    <span class="stat-hint">重试耗尽或不可重试</span>
+  </article>
+</section>
+
+<section class="split">
+  <article class="card">
+    <header class="card-head">
+      <h2>可用渠道</h2>
+      <a class="link" href="/app/send">发送消息 →</a>
+    </header>
+    {{if .Data.Channels}}
+    <ul class="tag-list">
+      {{range .Data.Channels}}<li class="tag">{{.}}</li>{{end}}
+    </ul>
+    {{else}}
+    <p class="empty">没有启用任何渠道，请检查 config.yaml 与 .env。</p>
+    {{end}}
+  </article>
+  <article class="card">
+    <header class="card-head">
+      <h2>渠道组</h2>
+      <a class="link" href="/app/messages">查看消息 →</a>
+    </header>
+    {{if .Data.Groups}}
+    <ul class="tag-list">
+      {{range .Data.Groups}}<li class="tag tag-muted">{{.}}</li>{{end}}
+    </ul>
+    {{else}}
+    <p class="empty">没有配置渠道组。</p>
+    {{end}}
+  </article>
+</section>
+
+<section class="card">
+  <header class="card-head">
+    <h2>最近消息</h2>
+    <a class="link" href="/app/messages">全部记录 →</a>
+  </header>
+  {{if .Data.Recent}}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>时间</th><th>级别</th><th>标题</th><th>来源</th><th>状态</th><th>渠道</th></tr>
+      </thead>
+      <tbody>
+      {{range .Data.Recent}}
+        <tr>
+          <td class="nowrap muted">{{fmtTime .Message.CreatedAt}}</td>
+          <td><span class="level level-{{.Message.Level}}">{{levelLabel .Message.Level}}</span></td>
+          <td><a href="/app/messages/{{.Message.ID}}">{{truncate (defaultText .Message.Title .Message.Body) 48}}</a></td>
+          <td class="muted">{{defaultText .Message.Source "-"}}</td>
+          <td><span class="{{statusClass .Status}}">{{statusLabel .Status}}</span></td>
+          <td class="muted">{{range .Deliveries}}{{.Channel}} {{end}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <p class="empty">还没有消息。去<a href="/app/send">发送第一条</a>，或让脚本用 Token 调用 <code>POST /v1/messages</code>。</p>
+  {{end}}
+</section>
+{{end}}

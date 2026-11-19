@@ -1,0 +1,37 @@
+{{define "content"}}
+<section class="split">
+  <article class="card">
+    <header class="card-head"><h2>账号信息</h2></header>
+    <dl class="meta-grid meta-grid-two">
+      <div><dt>用户名</dt><dd class="mono">{{.User.Username}}</dd></div>
+      <div><dt>显示名</dt><dd>{{defaultText .User.DisplayName "-"}}</dd></div>
+      <div><dt>角色</dt><dd>{{if .User.IsAdmin}}管理员{{else}}成员{{end}}</dd></div>
+      <div><dt>最近登录</dt><dd>{{fmtTimePtr .User.LastLoginAt}}</dd></div>
+      <div><dt>创建时间</dt><dd>{{fmtTime .User.CreatedAt}}</dd></div>
+    </dl>
+  </article>
+
+  <article class="card">
+    <header class="card-head"><h2>修改密码</h2></header>
+    <form method="post" action="/app/account/password" class="stack">
+      <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+      <label class="field">
+        <span>当前密码</span>
+        <input type="password" name="current_password" autocomplete="current-password" required>
+      </label>
+      <label class="field">
+        <span>新密码</span>
+        <input type="password" name="new_password" minlength="8" autocomplete="new-password" required>
+      </label>
+      <label class="field">
+        <span>确认新密码</span>
+        <input type="password" name="confirm_password" minlength="8" autocomplete="new-password" required>
+      </label>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">保存</button>
+      </div>
+      <p class="hint">修改后其他设备上的登录会话会失效，当前会话保留。</p>
+    </form>
+  </article>
+</section>
+{{end}}

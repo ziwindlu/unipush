@@ -112,6 +112,39 @@ var migrations = []string{
 	// M4：只读消息列表按创建时间倒序翻页；按来源过滤也走索引。
 	`CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC, id DESC)`,
 	`CREATE INDEX IF NOT EXISTS idx_messages_source_created ON messages(source, created_at DESC, id DESC)`,
+	// M5：Web 控制台的多用户登录、会话与可撤销的 API Token。
+	`CREATE TABLE IF NOT EXISTS users (
+		id            TEXT PRIMARY KEY,
+		username      TEXT NOT NULL COLLATE NOCASE UNIQUE,
+		display_name  TEXT NOT NULL DEFAULT '',
+		password_hash TEXT NOT NULL,
+		role          TEXT NOT NULL DEFAULT 'member',
+		disabled      INTEGER NOT NULL DEFAULT 0,
+		created_at    INTEGER NOT NULL,
+		updated_at    INTEGER NOT NULL,
+		last_login_at INTEGER
+	)`,
+	`CREATE TABLE IF NOT EXISTS sessions (
+		token_hash  TEXT PRIMARY KEY,
+		user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		csrf_token  TEXT NOT NULL,
+		created_at  INTEGER NOT NULL,
+		expires_at  INTEGER NOT NULL,
+		last_seen_at INTEGER NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)`,
+	`CREATE TABLE IF NOT EXISTS api_tokens (
+		id           TEXT PRIMARY KEY,
+		user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		name         TEXT NOT NULL,
+		token_hash   TEXT NOT NULL UNIQUE,
+		prefix       TEXT NOT NULL,
+		created_at   INTEGER NOT NULL,
+		last_used_at INTEGER,
+		revoked_at   INTEGER
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(user_id)`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {

@@ -1,0 +1,67 @@
+{{define "content"}}
+<form method="get" action="/app/messages" class="filter-bar">
+  <label class="field field-inline">
+    <span>来源</span>
+    <input type="text" name="source" value="{{.Data.Source}}" placeholder="例如 ci / nas-monitor">
+  </label>
+  <label class="field field-inline">
+    <span>级别</span>
+    <select name="level">
+      <option value="">全部</option>
+      <option value="info"{{if eq .Data.Level "info"}} selected{{end}}>信息</option>
+      <option value="warn"{{if eq .Data.Level "warn"}} selected{{end}}>警告</option>
+      <option value="error"{{if eq .Data.Level "error"}} selected{{end}}>错误</option>
+    </select>
+  </label>
+  <label class="field field-inline">
+    <span>状态</span>
+    <select name="status">
+      <option value="">全部</option>
+      <option value="queued"{{if eq .Data.Status "queued"}} selected{{end}}>排队中</option>
+      <option value="aggregated"{{if eq .Data.Status "aggregated"}} selected{{end}}>已聚合</option>
+      <option value="in_progress"{{if eq .Data.Status "in_progress"}} selected{{end}}>投递中</option>
+      <option value="succeeded"{{if eq .Data.Status "succeeded"}} selected{{end}}>已送达</option>
+      <option value="partial"{{if eq .Data.Status "partial"}} selected{{end}}>部分失败</option>
+      <option value="failed"{{if eq .Data.Status "failed"}} selected{{end}}>失败</option>
+    </select>
+  </label>
+  <button type="submit" class="btn">筛选</button>
+  <a class="btn btn-ghost" href="/app/messages">重置</a>
+</form>
+
+<section class="card">
+  <header class="card-head">
+    <h2>消息记录</h2>
+    <span class="muted">本页 {{.Data.TotalShown}} 条</span>
+  </header>
+  {{if .Data.Items}}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>时间</th><th>级别</th><th>标题 / 正文</th><th>来源</th><th>状态</th><th>渠道</th></tr>
+      </thead>
+      <tbody>
+      {{range .Data.Items}}
+        <tr>
+          <td class="nowrap muted">{{fmtTime .Message.CreatedAt}}</td>
+          <td><span class="level level-{{.Message.Level}}">{{levelLabel .Message.Level}}</span></td>
+          <td>
+            <a href="/app/messages/{{.Message.ID}}">{{truncate (defaultText .Message.Title .Message.Body) 56}}</a>
+            {{if .Message.Title}}<div class="sub muted">{{truncate .Message.Body 60}}</div>{{end}}
+          </td>
+          <td class="muted">{{defaultText .Message.Source "-"}}</td>
+          <td><span class="{{statusClass .Status}}">{{statusLabel .Status}}</span></td>
+          <td class="muted nowrap">{{range .Deliveries}}{{.Channel}}·{{deliveryLabel .Status}} {{end}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{if .Data.HasMore}}
+  <div class="pager"><a class="btn" href="{{.Data.NextURL}}">下一页</a></div>
+  {{end}}
+  {{else}}
+  <p class="empty">没有符合条件的消息。</p>
+  {{end}}
+</section>
+{{end}}

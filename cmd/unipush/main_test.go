@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -10,12 +11,56 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ziwindlu/unipush/internal/auth"
 	"github.com/ziwindlu/unipush/internal/channel"
 	"github.com/ziwindlu/unipush/internal/config"
+	"github.com/ziwindlu/unipush/internal/store"
 )
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestResetUserPassword(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "reset.db")
+	cfgPath := writeConfig(t, "database:\n  path: "+dbPath+"\nauth:\n  tokens: [test-token]\n")
+	cfg := mustLoad(t, cfgPath)
+
+	ctx := context.Background()
+	st, err := store.Open(ctx, cfg.Database.Path)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	hash, err := auth.HashPassword("old-password")
+	if err != nil {
+		t.Fatalf("HashPassword: %v", err)
+	}
+	if err := st.CreateUser(ctx, &store.User{ID: "usr_1", Username: "admin", Role: store.RoleAdmin}, hash); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	st.Close()
+
+	t.Setenv("UNIPUSH_RESET_PASSWORD", "new-password-123")
+	if err := resetUserPassword(cfg, "admin", discardLogger()); err != nil {
+		t.Fatalf("resetUserPassword: %v", err)
+	}
+
+	st, err = store.Open(ctx, cfg.Database.Path)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	_, newHash, err := st.GetUserByUsername(ctx, "admin")
+	if err != nil {
+		t.Fatalf("GetUserByUsername: %v", err)
+	}
+	if !auth.VerifyPassword(newHash, "new-password-123") {
+		t.Fatal("新密码未生效")
+	}
+	if auth.VerifyPassword(newHash, "old-password") {
+		t.Fatal("旧密码不应继续有效")
+	}
 }
 
 func writeConfig(t *testing.T, body string) string {

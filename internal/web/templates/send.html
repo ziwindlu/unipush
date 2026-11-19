@@ -1,0 +1,68 @@
+{{define "content"}}
+<section class="card">
+  <header class="card-head">
+    <h2>发送消息</h2>
+    <span class="muted">等价于调用 <code>POST /v1/messages</code></span>
+  </header>
+
+  {{with .Data.Error}}<div class="flash flash-error"><p class="flash-text">{{.}}</p></div>{{end}}
+
+  <form method="post" action="/app/send" class="stack form-grid">
+    <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+    <label class="field">
+      <span>标题</span>
+      <input type="text" name="title" maxlength="200" value="{{.Data.Values.Title}}" placeholder="例如：备份完成">
+    </label>
+    <label class="field">
+      <span>级别</span>
+      <select name="level">
+        <option value="info"{{if eq .Data.Values.Level "info"}} selected{{end}}>信息（会被聚合）</option>
+        <option value="warn"{{if eq .Data.Values.Level "warn"}} selected{{end}}>警告（立即发送）</option>
+        <option value="error"{{if eq .Data.Values.Level "error"}} selected{{end}}>错误（立即发送）</option>
+      </select>
+    </label>
+    <label class="field field-wide">
+      <span>正文</span>
+      <textarea name="body" rows="6" maxlength="8000" placeholder="支持多行；标题与正文至少填一个">{{.Data.Values.Body}}</textarea>
+    </label>
+    <label class="field">
+      <span>来源</span>
+      <input type="text" name="source" maxlength="64" value="{{.Data.Values.Source}}" placeholder="web">
+    </label>
+    <label class="field">
+      <span>去重键（可选）</span>
+      <input type="text" name="dedupe_key" maxlength="256" value="{{.Data.Values.DedupeKey}}" placeholder="同一 key 在窗口内只发一次">
+    </label>
+    <label class="field field-wide">
+      <span>链接（可选）</span>
+      <input type="url" name="link" value="{{.Data.Values.Link}}" placeholder="https://…">
+    </label>
+
+    <fieldset class="field field-wide">
+      <legend>投递目标</legend>
+      <p class="hint">不勾选时按路由规则决定；勾选后只投递到选中的渠道组或渠道。</p>
+      {{if .Data.Groups}}
+      <div class="check-group">
+        <span class="check-title">渠道组</span>
+        {{range .Data.Groups}}
+        <label class="check"><input type="checkbox" name="targets" value="{{.}}"{{if containsString $.Data.Values.Targets .}} checked{{end}}> {{.}}</label>
+        {{end}}
+      </div>
+      {{end}}
+      {{if .Data.Channels}}
+      <div class="check-group">
+        <span class="check-title">单个渠道</span>
+        {{range .Data.Channels}}
+        <label class="check"><input type="checkbox" name="targets" value="{{.}}"{{if containsString $.Data.Values.Targets .}} checked{{end}}> {{.}}</label>
+        {{end}}
+      </div>
+      {{end}}
+    </fieldset>
+
+    <div class="form-actions field-wide">
+      <button type="submit" class="btn btn-primary">发送</button>
+      <a class="btn btn-ghost" href="/app/messages">取消</a>
+    </div>
+  </form>
+</section>
+{{end}}

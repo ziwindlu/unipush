@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -87,7 +86,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 
 	var before *store.MessageCursor
 	if raw := strings.TrimSpace(q.Get("cursor")); raw != "" {
-		cursor, err := decodeCursor(raw)
+		cursor, err := store.DecodeCursor(raw)
 		if err != nil {
 			s.writeError(w, http.StatusBadRequest, "invalid_request", "cursor 无效，请使用上一页返回的 next_cursor", "cursor")
 			return
@@ -126,32 +125,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	if hasMore && len(items) > 0 {
 		last := items[len(items)-1].Message
-		resp.NextCursor = encodeCursor(store.MessageCursor{CreatedAt: last.CreatedAt, ID: last.ID})
+		resp.NextCursor = store.EncodeCursor(store.MessageCursor{CreatedAt: last.CreatedAt, ID: last.ID})
 	}
 	s.writeJSON(w, http.StatusOK, resp)
-}
-
-// encodeCursor 把分页位置编码成不透明字符串，避免调用方依赖内部列。
-func encodeCursor(c store.MessageCursor) string {
-	raw := fmt.Sprintf("%d:%s", c.CreatedAt.UTC().UnixMilli(), c.ID)
-	return base64.RawURLEncoding.EncodeToString([]byte(raw))
-}
-
-func decodeCursor(encoded string) (*store.MessageCursor, error) {
-	raw, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil {
-		return nil, err
-	}
-	millis, id, ok := strings.Cut(string(raw), ":")
-	if !ok || id == "" {
-		return nil, fmt.Errorf("cursor 格式不正确")
-	}
-	var n int64
-	if _, err := fmt.Sscanf(millis, "%d", &n); err != nil {
-		return nil, err
-	}
-	if n <= 0 {
-		return nil, fmt.Errorf("cursor 时间无效")
-	}
-	return &store.MessageCursor{CreatedAt: time.UnixMilli(n).UTC(), ID: id}, nil
 }

@@ -1,4 +1,4 @@
-# 部署与运维（M4）
+# 部署与运维（M4 + M5）
 
 目标：一台机器上长期常驻，升级重启不丢队列，出问题能自己查。
 
@@ -137,7 +137,9 @@ curl -fsS http://127.0.0.1:8080/healthz
 
 3. 重启服务。没配 token 时服务会生成随机临时 token 并打印在启动日志里——只能本机调试，重启就变，生产必须配置固定 token。
 
-多个 token 目前权限相同（一期不做多租户/细粒度权限）。
+也可以不把 token 写进配置文件：登录 Web 控制台 → 「API Token」→ 生成，页面只展示一次明文，数据库只存 SHA-256 哈希；撤销立即生效。静态配置 token 与 Web 创建的 token 权限相同，目前不做细粒度权限。
+
+Web 控制台首次启动会创建管理员：优先使用 `UNIPUSH_ADMIN_USER` / `UNIPUSH_ADMIN_PASSWORD`，密码留空则随机生成并打印到启动日志。多用户、Token 与安全说明见 [web.md](web.md)。
 
 ## 配置项速查
 
@@ -148,6 +150,8 @@ curl -fsS http://127.0.0.1:8080/healthz
 | 变量 | 作用 |
 | --- | --- |
 | `UNIPUSH_AUTH_TOKEN` | 调用方 Bearer Token，至少一个 |
+| `UNIPUSH_ADMIN_USER` | 首次启动的 Web 管理员用户名（默认 `admin`） |
+| `UNIPUSH_ADMIN_PASSWORD` | 首次启动的管理员密码；留空随机生成并打印一次 |
 | `UNIPUSH_ADDR` | 覆盖 `server.addr`（Docker 用 `0.0.0.0:8080`） |
 | `UNIPUSH_DB_PATH` | 覆盖 `database.path`（Docker 用 `/data/unipush.db`） |
 | `UNIPUSH_LOG_FORMAT` | 覆盖 `log.format`：`text` / `json` |
@@ -166,6 +170,7 @@ curl -fsS http://127.0.0.1:8080/healthz
 | `server` | `addr`（`127.0.0.1:8080`）、`read_timeout` / `write_timeout` / `idle_timeout`、`shutdown_timeout`（10s）、`max_body_bytes`（1 MiB） | 监听地址与 HTTP 超时 |
 | `auth` | `tokens` | Bearer Token 列表 |
 | `database` | `path`（`./data/unipush.db`） | SQLite 路径，自动建目录、WAL、自动迁移 |
+| `web` | `enabled`（true）、`session_ttl`（168h） | Web 控制台开关与会话有效期；`admin_*` 只在首次启动生效 |
 | `dispatch` | `workers`（4）、`poll_interval`（1s）、`lease`（60s）、`max_attempts`（8）、`base_backoff`（2s）、`max_backoff`（5m）、`request_timeout`（15s） | 投递 worker 与重试 |
 | `channels.*` | `enabled` + 各自的 webhook/凭据 | 缺少凭据的渠道会自动禁用并在启动日志告警 |
 | `routing` | `groups` / `default` / `rules` | 渠道组与投递规则，详见 [routing.md](routing.md) |
@@ -226,6 +231,8 @@ curl -sS "http://127.0.0.1:8080/v1/messages?limit=20&cursor=<next_cursor>" \
 ## 备份与恢复 SQLite
 
 数据文件：`data/unipush.db` + 同目录的 `unipush.db-wal`、`unipush.db-shm`（WAL 模式）。
+
+Web 登录用户、会话与 API Token 都在同一个库里（密码和 Token 只存哈希），备份数据库就同时备份了控制台账号。
 
 > 不要在服务运行时只 `cp` 主库文件：最近的写入还在 WAL 里，拷出来可能缺数据。
 
@@ -293,7 +300,7 @@ docker compose ps        # 等 STATUS 变成 healthy
    - 返回 `503` 且 `checks.database = unavailable`：数据库路径不可写/文件损坏，先看启动日志和目录权限。
    - `status = degraded`：数据库正常但队列统计查不了，通常是瞬时锁，重试即可。
    - 连不上：进程没起来，看启动日志（端口占用、配置校验失败最常见）。
-2. **是鉴权问题吗**：接口返回 `401` = token 缺失/不对；确认 `.env` 里的 `UNIPUSH_AUTH_TOKEN` 与调用方一致，改完要重启（token 在启动时读取）。
+2. **是鉴权问题吗**：接口返回 `401` = token 缺失/不对/已撤销。静态 token 改完 `.env` 要重启；Web 控制台创建的 token 可在「API Token」页看状态与最近使用时间，所属用户被停用时也会 401。
 3. **是路由问题吗**：`503 no_route` / `400 invalid_request` 的 `error.message` 会写明是哪条规则、哪个组没有可用渠道。看 `config.yaml` 的 `routing`，以及启动日志里「渠道已禁用」的告警（凭据没配）。
 4. **消息卡在哪**：`GET /v1/messages/{id}` 看每条 delivery 的 `status`、`attempts`、`last_error`、`next_attempt_at`。
    - `pending` + `next_attempt_at` 在未来：正在退避重试，等即可。

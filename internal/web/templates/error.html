@@ -1,0 +1,11 @@
+{{define "content"}}
+<section class="card error-card">
+  <span class="error-code">出错了</span>
+  <h2>{{.Data.Title}}</h2>
+  {{with .Data.Detail}}<p class="muted">{{.}}</p>{{end}}
+  <div class="form-actions">
+    <a class="btn" href="/app">回到概览</a>
+    <a class="btn btn-ghost" href="/app/messages">消息记录</a>
+  </div>
+</section>
+{{end}}

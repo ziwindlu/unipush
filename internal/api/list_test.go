@@ -54,7 +54,7 @@ func TestListMessagesPassesFilters(t *testing.T) {
 
 	sinceTime := now.Add(-time.Hour).Truncate(time.Second)
 	since := sinceTime.Format(time.RFC3339)
-	cursor := encodeCursor(store.MessageCursor{CreatedAt: now.Add(-2 * time.Minute), ID: "msg_c"})
+	cursor := store.EncodeCursor(store.MessageCursor{CreatedAt: now.Add(-2 * time.Minute), ID: "msg_c"})
 	path := "/v1/messages?" + url.Values{
 		"limit":  {"2"},
 		"source": {"ci"},
@@ -119,7 +119,7 @@ func TestListMessagesNextCursor(t *testing.T) {
 	if next == "" {
 		t.Fatal("还有下一页时应返回 next_cursor")
 	}
-	cursor, err := decodeCursor(next)
+	cursor, err := store.DecodeCursor(next)
 	if err != nil {
 		t.Fatalf("next_cursor 无法解码: %v", err)
 	}

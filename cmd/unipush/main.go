@@ -11,9 +11,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ziwindlu/unipush/internal/api"
+	"github.com/ziwindlu/unipush/internal/auth"
 	"github.com/ziwindlu/unipush/internal/channel"
 	"github.com/ziwindlu/unipush/internal/channel/bark"
 	"github.com/ziwindlu/unipush/internal/channel/dingtalk"
@@ -25,6 +28,7 @@ import (
 	"github.com/ziwindlu/unipush/internal/dispatch"
 	"github.com/ziwindlu/unipush/internal/routing"
 	"github.com/ziwindlu/unipush/internal/store"
+	"github.com/ziwindlu/unipush/internal/web"
 )
 
 var version = "dev"
@@ -43,6 +47,7 @@ func run() error {
 	}
 	configPath := flag.String("config", defaultConfig, "配置文件路径")
 	showVersion := flag.Bool("version", false, "打印版本后退出")
+	resetUser := flag.String("reset-password", "", "重置指定 Web 用户的密码后退出")
 	flag.Parse()
 
 	if *showVersion {
@@ -67,7 +72,58 @@ func run() error {
 
 	logger = newLogger(os.Stdout, cfg.Log.Format, cfg.Log.Level)
 	slog.SetDefault(logger)
+	if *resetUser != "" {
+		return resetUserPassword(cfg, *resetUser, logger)
+	}
 	return serve(cfg, logger)
+}
+
+// resetUserPassword 为忘记密码的管理员提供离线恢复入口。
+// 密码优先取 UNIPUSH_RESET_PASSWORD，未设置时随机生成并打印。
+func resetUserPassword(cfg *config.Config, username string, logger *slog.Logger) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	st, err := store.Open(ctx, cfg.Database.Path)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	user, _, err := st.GetUserByUsername(ctx, strings.ToLower(strings.TrimSpace(username)))
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("用户 %q 不存在", username)
+		}
+		return err
+	}
+	password := strings.TrimSpace(os.Getenv("UNIPUSH_RESET_PASSWORD"))
+	generated := password == ""
+	if generated {
+		password, err = auth.GeneratePassword(16)
+		if err != nil {
+			return err
+		}
+	}
+	if len(password) < 8 {
+		return fmt.Errorf("UNIPUSH_RESET_PASSWORD 至少 8 个字符")
+	}
+	hash, err := auth.HashPassword(password)
+	if err != nil {
+		return err
+	}
+	if err := st.UpdateUserPassword(ctx, user.ID, hash); err != nil {
+		return err
+	}
+	if _, err := st.DeleteUserSessions(ctx, user.ID, ""); err != nil {
+		return err
+	}
+	if generated {
+		fmt.Printf("已重置用户 %s 的密码：%s\n", user.Username, password)
+	} else {
+		fmt.Printf("已重置用户 %s 的密码（来自 UNIPUSH_RESET_PASSWORD）\n", user.Username)
+	}
+	logger.Info("已重置 Web 用户密码", "username", user.Username, "generated", generated)
+	return nil
 }
 
 // newLogger 按配置创建结构化 logger：text 适合前台人读，json 适合容器日志采集。
@@ -125,6 +181,12 @@ func serve(cfg *config.Config, logger *slog.Logger) error {
 	}
 	defer st.Close()
 
+	if cfg.Web.Enabled {
+		if _, err := web.BootstrapAdmin(ctx, st, cfg.Web.AdminUser, cfg.Web.AdminPassword, logger); err != nil {
+			return fmt.Errorf("初始化 Web 控制台管理员: %w", err)
+		}
+	}
+
 	dispatcher := dispatch.New(st, senders, router, dispatch.Config{
 		Workers:        cfg.Dispatch.Workers,
 		PollInterval:   cfg.Dispatch.PollInterval,
@@ -148,11 +210,37 @@ func serve(cfg *config.Config, logger *slog.Logger) error {
 		AuthTokens:   cfg.Auth.Tokens,
 		MaxBodyBytes: cfg.Server.MaxBodyBytes,
 		Version:      version,
+		TokenVerifier: func(ctx context.Context, token string) (bool, error) {
+			_, _, err := st.VerifyAPIToken(ctx, auth.HashToken(token), time.Now().UTC())
+			if errors.Is(err, store.ErrNotFound) {
+				return false, nil
+			}
+			if err != nil {
+				return false, err
+			}
+			return true, nil
+		},
 	}, st, dispatcher, logger)
+
+	handler := http.Handler(apiServer.Handler())
+	if cfg.Web.Enabled {
+		webServer, err := web.New(web.Config{
+			Version:    version,
+			SessionTTL: cfg.Web.SessionTTL,
+		}, st, dispatcher, logger)
+		if err != nil {
+			return err
+		}
+		root := http.NewServeMux()
+		root.Handle("/v1/", apiServer.Handler())
+		root.Handle("/healthz", apiServer.Handler())
+		root.Handle("/", webServer.Handler())
+		handler = root
+	}
 
 	httpServer := &http.Server{
 		Addr:         cfg.Server.Addr,
-		Handler:      apiServer.Handler(),
+		Handler:      handler,
 		ReadTimeout:  cfg.Server.ReadTimeout,
 		WriteTimeout: cfg.Server.WriteTimeout,
 		IdleTimeout:  cfg.Server.IdleTimeout,

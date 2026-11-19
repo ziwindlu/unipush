@@ -1,0 +1,32 @@
+{{define "base"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>登录 · unipush</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="login-body">
+  <main class="login-wrap">
+    <section class="login-card">
+      <div class="brand brand-lg"><span class="brand-mark">u</span><span>unipush</span></div>
+      <p class="login-sub">统一消息推送平台 · 控制台</p>
+      {{with .Data.Error}}<div class="flash flash-error"><p class="flash-text">{{.}}</p></div>{{end}}
+      <form method="post" action="/login" class="stack">
+        <input type="hidden" name="next" value="{{.Data.Next}}">
+        <label class="field">
+          <span>用户名</span>
+          <input type="text" name="username" autocomplete="username" autocapitalize="none" required autofocus>
+        </label>
+        <label class="field">
+          <span>密码</span>
+          <input type="password" name="password" autocomplete="current-password" required>
+        </label>
+        <button type="submit" class="btn btn-primary btn-block">登录</button>
+      </form>
+      <p class="login-hint">首次启动时，管理员账号与初始密码会打印在服务启动日志里。</p>
+    </section>
+  </main>
+</body>
+</html>{{end}}
