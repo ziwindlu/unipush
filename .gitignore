@@ -1,0 +1,22 @@
+# 构建产物
+/unipush
+/bin/
+*.exe
+
+# 本地数据与配置
+/data/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.local
+config.local.yaml
+
+# 编辑器与系统
+.idea/
+.vscode/
+.DS_Store
+
+# 测试与覆盖率
+*.out
+coverage.html
