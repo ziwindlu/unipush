@@ -94,6 +94,20 @@ var migrations = []string{
 	`ALTER TABLE messages ADD COLUMN route TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE deliveries ADD COLUMN rule TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE deliveries ADD COLUMN route_groups TEXT NOT NULL DEFAULT '[]'`,
+	// M3：去重合并计数、digest 归属，以及 info 消息的聚合待办。
+	`ALTER TABLE messages ADD COLUMN merged_count INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE messages ADD COLUMN aggregated_into TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE messages ADD COLUMN digest_count INTEGER NOT NULL DEFAULT 0`,
+	`CREATE TABLE IF NOT EXISTS aggregates (
+		id          TEXT PRIMARY KEY,
+		bucket      TEXT NOT NULL,
+		message_id  TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+		targets     TEXT NOT NULL DEFAULT '[]',
+		created_at  INTEGER NOT NULL,
+		digest_id   TEXT NOT NULL DEFAULT '',
+		UNIQUE (message_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_aggregates_pending ON aggregates(digest_id, bucket, created_at)`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -129,6 +143,101 @@ func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 
 // Enqueue 在一个事务里写入消息和它的投递记录，保证「先落库再发送」。
 func (s *Store) Enqueue(ctx context.Context, msg *model.Message, deliveries []*model.Delivery) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: 开始事务: %w", err)
+	}
+	defer tx.Rollback()
+	if err := insertMessage(ctx, tx, msg, deliveries); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: 提交事务: %w", err)
+	}
+	return nil
+}
+
+// EnqueueOptions 控制一次入队的去重与聚合行为。
+type EnqueueOptions struct {
+	// DedupeWindow 大于 0 且消息带 dedupe_key 时，窗口内同 key 的消息会被合并。
+	DedupeWindow time.Duration
+	// AggregateBucket 非空时，消息进入该聚合桶，暂不创建投递记录。
+	AggregateBucket string
+}
+
+// EnqueueOutcome 是一次入队的结果。
+type EnqueueOutcome struct {
+	// MessageID 是本次入队的消息 ID；去重命中时是原消息的 ID。
+	MessageID string
+	// Merged 是去重命中后的累计合并次数。
+	Merged int
+	// Deduped 表示命中去重窗口，没有写入新消息与投递。
+	Deduped bool
+	// Aggregated 表示消息已进入聚合桶，投递等 digest 生成后统一进行。
+	Aggregated bool
+}
+
+// EnqueueMessage 在同一个事务里完成去重检查、聚合入桶或常规落库，
+// 保证「先落库再发送」以及并发下不会重复写入同一条 dedupe_key。
+func (s *Store) EnqueueMessage(ctx context.Context, msg *model.Message, deliveries []*model.Delivery, opts EnqueueOptions) (EnqueueOutcome, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return EnqueueOutcome{}, fmt.Errorf("store: 开始事务: %w", err)
+	}
+	defer tx.Rollback()
+
+	if opts.DedupeWindow > 0 && msg.DedupeKey != "" {
+		cutoff := msg.CreatedAt.Add(-opts.DedupeWindow).UnixMilli()
+		var existingID string
+		var merged int
+		err := tx.QueryRowContext(ctx, `SELECT id, merged_count FROM messages
+			WHERE dedupe_key = ? AND created_at >= ?
+			ORDER BY created_at DESC LIMIT 1`, msg.DedupeKey, cutoff).Scan(&existingID, &merged)
+		switch {
+		case err == nil:
+			merged++
+			if _, err := tx.ExecContext(ctx, `UPDATE messages SET merged_count = ? WHERE id = ?`, merged, existingID); err != nil {
+				return EnqueueOutcome{}, fmt.Errorf("store: 累加合并次数: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return EnqueueOutcome{}, fmt.Errorf("store: 提交去重: %w", err)
+			}
+			return EnqueueOutcome{MessageID: existingID, Merged: merged, Deduped: true}, nil
+		case !errors.Is(err, sql.ErrNoRows):
+			return EnqueueOutcome{}, fmt.Errorf("store: 查询去重窗口: %w", err)
+		}
+	}
+
+	if opts.AggregateBucket != "" {
+		if err := insertMessage(ctx, tx, msg, nil); err != nil {
+			return EnqueueOutcome{}, err
+		}
+		targets, err := json.Marshal(msg.Targets)
+		if err != nil {
+			return EnqueueOutcome{}, fmt.Errorf("store: 序列化 targets: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO aggregates (id, bucket, message_id, targets, created_at)
+			VALUES (?, ?, ?, ?, ?)`,
+			model.NewID("agg_"), opts.AggregateBucket, msg.ID, string(targets), msg.CreatedAt.UnixMilli()); err != nil {
+			return EnqueueOutcome{}, fmt.Errorf("store: 写入聚合桶: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return EnqueueOutcome{}, fmt.Errorf("store: 提交聚合入桶: %w", err)
+		}
+		return EnqueueOutcome{MessageID: msg.ID, Aggregated: true}, nil
+	}
+
+	if err := insertMessage(ctx, tx, msg, deliveries); err != nil {
+		return EnqueueOutcome{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return EnqueueOutcome{}, fmt.Errorf("store: 提交事务: %w", err)
+	}
+	return EnqueueOutcome{MessageID: msg.ID}, nil
+}
+
+// insertMessage 在给定事务里写入消息与其投递记录。
+func insertMessage(ctx context.Context, tx *sql.Tx, msg *model.Message, deliveries []*model.Delivery) error {
 	targets, err := json.Marshal(msg.Targets)
 	if err != nil {
 		return fmt.Errorf("store: 序列化 targets: %w", err)
@@ -146,17 +255,13 @@ func (s *Store) Enqueue(ctx context.Context, msg *model.Message, deliveries []*m
 		route = string(encoded)
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("store: 开始事务: %w", err)
-	}
-	defer tx.Rollback()
-
 	if _, err := tx.ExecContext(ctx, `INSERT INTO messages
-		(id, title, body, level, source, targets, dedupe_key, link, extra, route, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(id, title, body, level, source, targets, dedupe_key, link, extra, route,
+		 merged_count, aggregated_into, digest_count, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		msg.ID, msg.Title, msg.Body, msg.Level, msg.Source, string(targets),
-		msg.DedupeKey, msg.Link, string(extra), route, msg.CreatedAt.UnixMilli()); err != nil {
+		msg.DedupeKey, msg.Link, string(extra), route,
+		msg.MergedCount, msg.AggregatedInto, msg.DigestCount, msg.CreatedAt.UnixMilli()); err != nil {
 		return fmt.Errorf("store: 写入消息: %w", err)
 	}
 	for _, d := range deliveries {
@@ -175,21 +280,131 @@ func (s *Store) Enqueue(ctx context.Context, msg *model.Message, deliveries []*m
 			return fmt.Errorf("store: 写入投递记录: %w", err)
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: 提交事务: %w", err)
-	}
 	return nil
 }
 
+// AggregateBucket 是一个待发 digest 的聚合桶。
+type AggregateBucket struct {
+	Bucket string
+	Count  int
+	Oldest time.Time
+}
+
+// DueAggregateBuckets 返回到期的聚合桶：最早一条已经超过窗口，或条数达到 maxItems。
+func (s *Store) DueAggregateBuckets(ctx context.Context, window time.Duration, maxItems int, now time.Time) ([]AggregateBucket, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT bucket, COUNT(*), MIN(created_at)
+		FROM aggregates WHERE digest_id = '' GROUP BY bucket ORDER BY MIN(created_at)`)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询聚合桶: %w", err)
+	}
+	defer rows.Close()
+
+	var due []AggregateBucket
+	for rows.Next() {
+		var bucket AggregateBucket
+		var oldest int64
+		if err := rows.Scan(&bucket.Bucket, &bucket.Count, &oldest); err != nil {
+			return nil, fmt.Errorf("store: 扫描聚合桶: %w", err)
+		}
+		bucket.Oldest = time.UnixMilli(oldest).UTC()
+		if (maxItems > 0 && bucket.Count >= maxItems) || !bucket.Oldest.Add(window).After(now) {
+			due = append(due, bucket)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: 遍历聚合桶: %w", err)
+	}
+	return due, nil
+}
+
+// AggregateItems 返回某个桶里尚未汇总的消息，按进入桶的时间升序。
+func (s *Store) AggregateItems(ctx context.Context, bucket string) ([]*model.Message, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+selectMessageFieldsAliased+`
+		FROM messages m JOIN aggregates a ON a.message_id = m.id
+		WHERE a.bucket = ? AND a.digest_id = ''
+		ORDER BY a.created_at, m.id`, bucket)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询聚合消息: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*model.Message
+	for rows.Next() {
+		msg, err := scanMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, msg)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: 遍历聚合消息: %w", err)
+	}
+	return out, nil
+}
+
+// FlushAggregate 把桶里待汇总的消息标记为已汇入 digest，并写入 digest 消息与其投递记录。
+// 返回被汇总的消息条数。
+func (s *Store) FlushAggregate(ctx context.Context, bucket, digestID string, digest *model.Message, deliveries []*model.Delivery) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("store: 开始事务: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx, `UPDATE aggregates SET digest_id = ?
+		WHERE bucket = ? AND digest_id = ''`, digestID, bucket)
+	if err != nil {
+		return 0, fmt.Errorf("store: 认领聚合桶: %w", err)
+	}
+	count, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: 统计聚合桶: %w", err)
+	}
+	if count == 0 {
+		return 0, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE messages SET aggregated_into = ?
+		WHERE id IN (SELECT message_id FROM aggregates WHERE digest_id = ?)`, digestID, digestID); err != nil {
+		return 0, fmt.Errorf("store: 标记聚合归属: %w", err)
+	}
+	digest.DigestCount = int(count)
+	if err := insertMessage(ctx, tx, digest, deliveries); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("store: 提交聚合: %w", err)
+	}
+	return int(count), nil
+}
+
+const selectMessageFields = `id, title, body, level, source, targets, dedupe_key,
+	link, extra, route, merged_count, aggregated_into, digest_count, created_at`
+
+const selectMessageColumns = `SELECT ` + selectMessageFields + ` FROM messages`
+
+const selectMessageFieldsAliased = `m.id, m.title, m.body, m.level, m.source, m.targets, m.dedupe_key,
+	m.link, m.extra, m.route, m.merged_count, m.aggregated_into, m.digest_count, m.created_at`
+
 // GetMessage 读取一条消息，不存在时返回 ErrNotFound。
 func (s *Store) GetMessage(ctx context.Context, id string) (*model.Message, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, title, body, level, source, targets,
-		dedupe_key, link, extra, route, created_at FROM messages WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, selectMessageColumns+` WHERE id = ?`, id)
+	msg, err := scanMessage(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, ErrNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return msg, nil
+}
+
+func scanMessage(row scanner) (*model.Message, error) {
 	msg := &model.Message{}
 	var targets, extra, route string
 	var createdAt int64
 	if err := row.Scan(&msg.ID, &msg.Title, &msg.Body, &msg.Level, &msg.Source, &targets,
-		&msg.DedupeKey, &msg.Link, &extra, &route, &createdAt); err != nil {
+		&msg.DedupeKey, &msg.Link, &extra, &route, &msg.MergedCount, &msg.AggregatedInto,
+		&msg.DigestCount, &createdAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -209,6 +424,29 @@ func (s *Store) GetMessage(ctx context.Context, id string) (*model.Message, erro
 	}
 	msg.CreatedAt = time.UnixMilli(createdAt).UTC()
 	return msg, nil
+}
+
+// ListAggregatedMessages 返回被汇总进某条 digest 的原始消息 ID（按进入桶的顺序）。
+func (s *Store) ListAggregatedMessages(ctx context.Context, digestID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT message_id FROM aggregates
+		WHERE digest_id = ? ORDER BY created_at, message_id`, digestID)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询 digest 组成: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("store: 扫描 digest 组成: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: 遍历 digest 组成: %w", err)
+	}
+	return ids, nil
 }
 
 // ListDeliveries 读取一条消息的全部投递记录。

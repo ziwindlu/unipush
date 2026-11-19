@@ -158,3 +158,142 @@ func TestLoadDotEnvMissingFile(t *testing.T) {
 		t.Fatalf("缺失 .env 应静默返回，实际 n=%d err=%v", n, err)
 	}
 }
+
+// TestLoadDisablesChannelsWithoutCredentials 保证新增渠道凭据缺失时只是禁用并告警，
+// 不会让服务起不来；同时检查 M3 的默认值。
+func TestLoadDisablesChannelsWithoutCredentials(t *testing.T) {
+	for _, key := range []string{
+		"TEST_FEISHU_WEBHOOK", "TEST_WECOM_WEBHOOK", "TEST_WEBHOOK_URL",
+		"TEST_SMTP_FROM", "TEST_SMTP_USER",
+	} {
+		t.Setenv(key, "")
+	}
+	cfg, err := config.Load(writeConfig(t, `
+auth:
+  tokens: [test-token]
+channels:
+  feishu:
+    webhook: ${TEST_FEISHU_WEBHOOK}
+  wecom:
+    webhook: ${TEST_WECOM_WEBHOOK}
+  email:
+    from: ${TEST_SMTP_FROM}
+  webhook:
+    url: ${TEST_WEBHOOK_URL}
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Channels.Feishu.Enabled || cfg.Channels.WeCom.Enabled ||
+		cfg.Channels.Email.Enabled || cfg.Channels.Webhook.Enabled {
+		t.Errorf("凭据缺失的新渠道应被禁用: %+v", cfg.Channels)
+	}
+	if cfg.Channels.Feishu.MsgType != "text" || cfg.Channels.WeCom.MsgType != "markdown" {
+		t.Errorf("新渠道消息形态默认值错误: feishu=%q wecom=%q",
+			cfg.Channels.Feishu.MsgType, cfg.Channels.WeCom.MsgType)
+	}
+	if cfg.Channels.Email.TLS != "starttls" || cfg.Channels.Email.Port != 587 {
+		t.Errorf("email 默认值错误: tls=%q port=%d", cfg.Channels.Email.TLS, cfg.Channels.Email.Port)
+	}
+	if cfg.Channels.Webhook.Method != "POST" {
+		t.Errorf("webhook 方法默认值错误: %q", cfg.Channels.Webhook.Method)
+	}
+	if !cfg.Dedupe.Enabled || cfg.Dedupe.Window != 5*time.Minute {
+		t.Errorf("去重默认值错误: %+v", cfg.Dedupe)
+	}
+	if !cfg.Aggregation.Enabled || cfg.Aggregation.Window != time.Minute || cfg.Aggregation.MaxItems != 50 {
+		t.Errorf("聚合默认值错误: %+v", cfg.Aggregation)
+	}
+}
+
+// TestLoadNormalizesNewChannels 检查配置项的大小写/空格归一化与启用判断。
+func TestLoadNormalizesNewChannels(t *testing.T) {
+	t.Setenv("TEST_FEISHU_WEBHOOK", "https://open.feishu.cn/open-apis/bot/v2/hook/abc")
+	t.Setenv("TEST_WECOM_WEBHOOK", "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc")
+	t.Setenv("TEST_WEBHOOK_URL", "https://example.com/hook")
+	t.Setenv("TEST_SMTP_FROM", "bot@example.com")
+
+	cfg, err := config.Load(writeConfig(t, `
+auth:
+  tokens: [test-token]
+channels:
+  feishu:
+    webhook: ${TEST_FEISHU_WEBHOOK}
+    msg_type: " Card "
+  wecom:
+    webhook: ${TEST_WECOM_WEBHOOK}
+  email:
+    host: smtp.example.com
+    from: ${TEST_SMTP_FROM}
+    to: [" me@example.com ", ""]
+  webhook:
+    url: ${TEST_WEBHOOK_URL}
+    method: put
+    headers:
+      " X-Token ": " secret "
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Channels.Feishu.Enabled || cfg.Channels.Feishu.MsgType != "card" {
+		t.Errorf("feishu 归一化错误: %+v", cfg.Channels.Feishu)
+	}
+	if !cfg.Channels.WeCom.Enabled || !cfg.Channels.Email.Enabled || !cfg.Channels.Webhook.Enabled {
+		t.Errorf("四个新渠道都应启用: %+v", cfg.Channels)
+	}
+	if len(cfg.Channels.Email.To) != 1 || cfg.Channels.Email.To[0] != "me@example.com" {
+		t.Errorf("收件人应去空格并丢弃空项: %#v", cfg.Channels.Email.To)
+	}
+	if cfg.Channels.Webhook.Method != "PUT" {
+		t.Errorf("webhook 方法应转大写: %q", cfg.Channels.Webhook.Method)
+	}
+	if got := cfg.Channels.Webhook.Headers["X-Token"]; got != "secret" {
+		t.Errorf("请求头应去空格: %#v", cfg.Channels.Webhook.Headers)
+	}
+}
+
+// TestLoadRejectsInvalidM3Settings 保证错误的渠道设置与去重/聚合参数在启动时暴露。
+func TestLoadRejectsInvalidM3Settings(t *testing.T) {
+	cases := map[string]string{
+		"feishu msg_type 非法": `channels:
+  feishu:
+    webhook: https://example.com/hook
+    msg_type: markdown
+`,
+		"wecom msg_type 非法": `channels:
+  wecom:
+    webhook: https://example.com/hook
+    msg_type: card
+`,
+		"email tls 非法": `channels:
+  email:
+    host: smtp.example.com
+    from: a@example.com
+    to: [b@example.com]
+    tls: tls
+`,
+		"email port 越界": `channels:
+  email:
+    host: smtp.example.com
+    port: 70000
+    from: a@example.com
+    to: [b@example.com]
+`,
+		"dedupe window 为 0": `dedupe:
+  enabled: true
+  window: 0s
+`,
+		"aggregation max_items 为 0": `aggregation:
+  enabled: true
+  window: 1m
+  max_items: 0
+`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := config.Load(writeConfig(t, body)); err == nil {
+				t.Fatalf("期望校验失败")
+			}
+		})
+	}
+}

@@ -16,6 +16,10 @@ import (
 	"github.com/ziwindlu/unipush/internal/channel"
 	"github.com/ziwindlu/unipush/internal/channel/bark"
 	"github.com/ziwindlu/unipush/internal/channel/dingtalk"
+	"github.com/ziwindlu/unipush/internal/channel/email"
+	"github.com/ziwindlu/unipush/internal/channel/feishu"
+	"github.com/ziwindlu/unipush/internal/channel/webhook"
+	"github.com/ziwindlu/unipush/internal/channel/wecom"
 	"github.com/ziwindlu/unipush/internal/config"
 	"github.com/ziwindlu/unipush/internal/dispatch"
 	"github.com/ziwindlu/unipush/internal/routing"
@@ -100,6 +104,15 @@ func serve(configPath string, logger *slog.Logger) error {
 		BaseBackoff:    cfg.Dispatch.BaseBackoff,
 		MaxBackoff:     cfg.Dispatch.MaxBackoff,
 		RequestTimeout: cfg.Dispatch.RequestTimeout,
+		Dedupe: dispatch.DedupeConfig{
+			Enabled: cfg.Dedupe.Enabled,
+			Window:  cfg.Dedupe.Window,
+		},
+		Aggregation: dispatch.AggregationConfig{
+			Enabled:  cfg.Aggregation.Enabled,
+			Window:   cfg.Aggregation.Window,
+			MaxItems: cfg.Aggregation.MaxItems,
+		},
 	}, logger)
 
 	apiServer := api.New(api.Config{
@@ -188,6 +201,60 @@ func buildSenders(cfg *config.Config, logger *slog.Logger) (channel.Set, error) 
 			Secret:  cfg.Channels.DingTalk.Secret,
 			Keyword: cfg.Channels.DingTalk.Keyword,
 			Timeout: cfg.Dispatch.RequestTimeout,
+		})
+		if err != nil {
+			return nil, err
+		}
+		senders[s.Name()] = s
+	}
+	if cfg.Channels.Feishu.Enabled {
+		s, err := feishu.New(feishu.Config{
+			Webhook: cfg.Channels.Feishu.Webhook,
+			Secret:  cfg.Channels.Feishu.Secret,
+			MsgType: cfg.Channels.Feishu.MsgType,
+			Timeout: cfg.Dispatch.RequestTimeout,
+		})
+		if err != nil {
+			return nil, err
+		}
+		senders[s.Name()] = s
+	}
+	if cfg.Channels.WeCom.Enabled {
+		s, err := wecom.New(wecom.Config{
+			Webhook: cfg.Channels.WeCom.Webhook,
+			MsgType: cfg.Channels.WeCom.MsgType,
+			Timeout: cfg.Dispatch.RequestTimeout,
+		})
+		if err != nil {
+			return nil, err
+		}
+		senders[s.Name()] = s
+	}
+	if cfg.Channels.Email.Enabled {
+		s, err := email.New(email.Config{
+			Host:          cfg.Channels.Email.Host,
+			Port:          cfg.Channels.Email.Port,
+			Username:      cfg.Channels.Email.Username,
+			Password:      cfg.Channels.Email.Password,
+			From:          cfg.Channels.Email.From,
+			To:            cfg.Channels.Email.To,
+			TLS:           cfg.Channels.Email.TLS,
+			SubjectPrefix: cfg.Channels.Email.SubjectPrefix,
+			Timeout:       cfg.Dispatch.RequestTimeout,
+		})
+		if err != nil {
+			return nil, err
+		}
+		senders[s.Name()] = s
+	}
+	if cfg.Channels.Webhook.Enabled {
+		s, err := webhook.New(webhook.Config{
+			URL:          cfg.Channels.Webhook.URL,
+			Method:       cfg.Channels.Webhook.Method,
+			Headers:      cfg.Channels.Webhook.Headers,
+			ContentType:  cfg.Channels.Webhook.ContentType,
+			BodyTemplate: cfg.Channels.Webhook.BodyTemplate,
+			Timeout:      cfg.Dispatch.RequestTimeout,
 		})
 		if err != nil {
 			return nil, err

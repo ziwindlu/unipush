@@ -28,6 +28,21 @@ type Config struct {
 	BaseBackoff    time.Duration
 	MaxBackoff     time.Duration
 	RequestTimeout time.Duration
+	Dedupe         DedupeConfig
+	Aggregation    AggregationConfig
+}
+
+// DedupeConfig 是去重配置。
+type DedupeConfig struct {
+	Enabled bool
+	Window  time.Duration
+}
+
+// AggregationConfig 是 info 级消息聚合配置。
+type AggregationConfig struct {
+	Enabled  bool
+	Window   time.Duration
+	MaxItems int
 }
 
 // DefaultConfig 返回可直接使用的默认配置。
@@ -40,6 +55,8 @@ func DefaultConfig() Config {
 		BaseBackoff:    2 * time.Second,
 		MaxBackoff:     5 * time.Minute,
 		RequestTimeout: 15 * time.Second,
+		Dedupe:         DedupeConfig{Enabled: true, Window: 5 * time.Minute},
+		Aggregation:    AggregationConfig{Enabled: true, Window: time.Minute, MaxItems: 50},
 	}
 }
 
@@ -50,9 +67,13 @@ type Dispatcher struct {
 	// router 为 nil 时退化为 M1 行为：targets 即渠道名，不传表示全部启用渠道。
 	router *routing.Router
 	cfg    Config
-	log    *slog.Logger
-	wake   chan struct{}
-	now    func() time.Time
+	dedupe DedupeConfig
+	agg    AggregationConfig
+	// flushEvery 是检查聚合桶的间隔，由聚合窗口推导。
+	flushEvery time.Duration
+	log        *slog.Logger
+	wake       chan struct{}
+	now        func() time.Time
 }
 
 // New 创建 Dispatcher。router 可以为 nil，表示不做规则路由。
@@ -78,17 +99,37 @@ func New(st *store.Store, senders channel.Set, router *routing.Router, cfg Confi
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 15 * time.Second
 	}
+	if cfg.Dedupe.Window <= 0 {
+		cfg.Dedupe.Window = 5 * time.Minute
+	}
+	if cfg.Aggregation.Window <= 0 {
+		cfg.Aggregation.Window = time.Minute
+	}
+	if cfg.Aggregation.MaxItems < 1 {
+		cfg.Aggregation.MaxItems = 50
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// 聚合桶的检查频率：窗口的四分之一，夹在 500ms 到 5s 之间。
+	flushEvery := cfg.Aggregation.Window / 4
+	if flushEvery < 500*time.Millisecond {
+		flushEvery = 500 * time.Millisecond
+	}
+	if flushEvery > 5*time.Second {
+		flushEvery = 5 * time.Second
+	}
 	return &Dispatcher{
-		store:   st,
-		senders: senders,
-		router:  router,
-		cfg:     cfg,
-		log:     logger,
-		wake:    make(chan struct{}, 1),
-		now:     time.Now,
+		store:      st,
+		senders:    senders,
+		router:     router,
+		cfg:        cfg,
+		dedupe:     cfg.Dedupe,
+		agg:        cfg.Aggregation,
+		flushEvery: flushEvery,
+		log:        logger,
+		wake:       make(chan struct{}, 1),
+		now:        time.Now,
 	}
 }
 
@@ -111,11 +152,11 @@ func (dsp *Dispatcher) Wake() {
 	}
 }
 
-// Enqueue 解析路由、为每个目标渠道创建投递记录并落库。
+// Enqueue 解析路由，按需执行去重与聚合，然后把消息落库。
 //
-// 路由顺序：调用方 targets（渠道组或渠道名）→ 按 source/level 命中的规则 → 默认目标。
-// 解析结果写入 msg.Route，并随每条 delivery 记录命中的规则与渠道组。
-func (dsp *Dispatcher) Enqueue(ctx context.Context, msg *model.Message) ([]*model.Delivery, error) {
+// 顺序是：路由校验 → 去重（窗口内同 dedupe_key 只投递一次）→ 聚合（info 消息攒成 digest）。
+// 命中去重或进入聚合桶时都不会产生新的投递记录，返回值里会给出合并次数。
+func (dsp *Dispatcher) Enqueue(ctx context.Context, msg *model.Message) (*model.EnqueueResult, error) {
 	now := dsp.now()
 	if msg.CreatedAt.IsZero() {
 		msg.CreatedAt = now
@@ -125,8 +166,44 @@ func (dsp *Dispatcher) Enqueue(ctx context.Context, msg *model.Message) ([]*mode
 	if err != nil {
 		return nil, err
 	}
+	deliveries := dsp.buildDeliveries(msg, channels, channelGroups, now)
 
+	opts := store.EnqueueOptions{}
+	if dsp.dedupe.Enabled && msg.DedupeKey != "" {
+		opts.DedupeWindow = dsp.dedupe.Window
+	}
+	if dsp.agg.Enabled && msg.Level == model.LevelInfo {
+		opts.AggregateBucket = aggregateBucket(msg)
+	}
+
+	outcome, err := dsp.store.EnqueueMessage(ctx, msg, deliveries, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	res := &model.EnqueueResult{MessageID: outcome.MessageID, Route: msg.Route}
+	switch {
+	case outcome.Deduped:
+		res.Status = model.EnqueueDeduped
+		res.Merged = outcome.Merged
+	case outcome.Aggregated:
+		res.Status = model.EnqueueAggregated
+	default:
+		res.Status = model.EnqueueQueued
+		res.Deliveries = deliveries
+		// 先落库再唤醒 worker：进程在两步之间崩溃也不会丢消息。
+		dsp.Wake()
+	}
+	return res, nil
+}
+
+// buildDeliveries 为解析出的每个渠道生成投递记录。
+func (dsp *Dispatcher) buildDeliveries(msg *model.Message, channels []string, channelGroups map[string][]string, now time.Time) []*model.Delivery {
 	deliveries := make([]*model.Delivery, 0, len(channels))
+	rule := ""
+	if msg.Route != nil {
+		rule = msg.Route.Rule
+	}
 	for _, name := range channels {
 		deliveries = append(deliveries, &model.Delivery{
 			ID:            model.NewID("dlv_"),
@@ -134,20 +211,14 @@ func (dsp *Dispatcher) Enqueue(ctx context.Context, msg *model.Message) ([]*mode
 			Channel:       name,
 			Status:        model.DeliveryPending,
 			MaxAttempts:   dsp.cfg.MaxAttempts,
-			Rule:          msg.Route.Rule,
+			Rule:          rule,
 			Groups:        channelGroups[name],
 			NextAttemptAt: &now,
 			CreatedAt:     now,
 			UpdatedAt:     now,
 		})
 	}
-
-	// 先落库再唤醒 worker：进程在两步之间崩溃也不会丢消息。
-	if err := dsp.store.Enqueue(ctx, msg, deliveries); err != nil {
-		return nil, err
-	}
-	dsp.Wake()
-	return deliveries, nil
+	return deliveries
 }
 
 // resolve 计算消息的投递渠道，并把结果写入 msg.Route。
@@ -190,6 +261,13 @@ func (dsp *Dispatcher) Run(ctx context.Context) {
 	}
 
 	var wg sync.WaitGroup
+	if dsp.agg.Enabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			dsp.aggregateLoop(ctx)
+		}()
+	}
 	for i := 0; i < dsp.cfg.Workers; i++ {
 		wg.Add(1)
 		go func() {

@@ -26,7 +26,7 @@ type Set map[string]Sender
 
 // Known 返回当前版本支持的全部渠道名（无论本次运行是否启用）。
 // 路由配置里引用这个集合之外的渠道名会在启动时报错。
-func Known() []string { return []string{"bark", "dingtalk"} }
+func Known() []string { return []string{"bark", "dingtalk", "feishu", "wecom", "email", "webhook"} }
 
 // Names 返回排好序的渠道名，保证投递顺序和接口输出稳定。
 func (s Set) Names() []string {

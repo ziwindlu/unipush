@@ -68,14 +68,14 @@ channels:
     enabled: false
 routing:
   groups:
-    phone: [bark, feishu]
+    phone: [bark, telegram]
   default: [phone]
 `)
 	err := serve(path, discardLogger())
 	if err == nil {
 		t.Fatal("组里引用未知渠道时，启动应直接失败")
 	}
-	for _, want := range []string{"routing.groups.phone.channels[1]", "未知渠道", "feishu"} {
+	for _, want := range []string{"routing.groups.phone.channels[1]", "未知渠道", "telegram"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("启动错误应包含 %q，实际: %s", want, err.Error())
 		}
@@ -134,5 +134,24 @@ func TestBuildRouterWithoutRoutingSection(t *testing.T) {
 	}
 	if router.Configured() {
 		t.Error("未配置 routing 段时 Configured() 应为 false")
+	}
+}
+
+// TestSampleConfigLoads 保证仓库里的 config.yaml 样例始终能被加载并编译出路由，
+// 避免示例配置与代码里的字段名脱节。
+func TestSampleConfigLoads(t *testing.T) {
+	cfg, err := config.Load("../../config.yaml")
+	if err != nil {
+		t.Fatalf("加载 config.yaml 样例失败: %v", err)
+	}
+	if !cfg.Dedupe.Enabled || cfg.Dedupe.Window <= 0 {
+		t.Errorf("样例配置应开启去重: %+v", cfg.Dedupe)
+	}
+	if !cfg.Aggregation.Enabled || cfg.Aggregation.Window <= 0 || cfg.Aggregation.MaxItems < 1 {
+		t.Errorf("样例配置应开启聚合: %+v", cfg.Aggregation)
+	}
+	// 样例里没有真实凭据，渠道会被自动禁用；路由仍应能编译（组里没有已启用渠道只是告警）。
+	if _, err := buildRouter(cfg, channel.Set{}); err != nil {
+		t.Fatalf("样例配置的路由编译失败: %v", err)
 	}
 }

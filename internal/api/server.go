@@ -24,6 +24,7 @@ import (
 type Store interface {
 	GetMessage(ctx context.Context, id string) (*model.Message, error)
 	ListDeliveries(ctx context.Context, messageID string) ([]*model.Delivery, error)
+	ListAggregatedMessages(ctx context.Context, digestID string) ([]string, error)
 	Ping(ctx context.Context) error
 }
 
@@ -31,7 +32,7 @@ type Store interface {
 type Queue interface {
 	Channels() []string
 	Groups() []string
-	Enqueue(ctx context.Context, msg *model.Message) ([]*model.Delivery, error)
+	Enqueue(ctx context.Context, msg *model.Message) (*model.EnqueueResult, error)
 }
 
 // Config 是 API 配置。
@@ -122,20 +123,31 @@ func (s *Server) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deliveries, err := s.queue.Enqueue(r.Context(), msg)
+	result, err := s.queue.Enqueue(r.Context(), msg)
 	if err != nil {
 		s.writeEnqueueError(w, msg.ID, err)
 		return
 	}
 
-	resp := createResponse{
-		ID:         msg.ID,
-		Status:     "queued",
-		CreatedAt:  msg.CreatedAt,
-		Route:      msg.Route,
-		Deliveries: make([]deliverySummary, 0, len(deliveries)),
+	createdAt := msg.CreatedAt
+	merged := result.Merged
+	if result.Status == model.EnqueueDeduped {
+		// 命中去重时返回原消息的创建时间与累计合并次数，调用方据此判断「这是第几次重复」。
+		if original, err := s.store.GetMessage(r.Context(), result.MessageID); err == nil {
+			createdAt = original.CreatedAt
+			merged = original.MergedCount
+		}
 	}
-	for _, d := range deliveries {
+
+	resp := createResponse{
+		ID:         result.MessageID,
+		Status:     string(result.Status),
+		Merged:     merged,
+		CreatedAt:  createdAt,
+		Route:      result.Route,
+		Deliveries: make([]deliverySummary, 0, len(result.Deliveries)),
+	}
+	for _, d := range result.Deliveries {
 		resp.Deliveries = append(resp.Deliveries, deliverySummary{
 			ID:      d.ID,
 			Channel: d.Channel,
@@ -143,7 +155,7 @@ func (s *Server) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
 			Groups:  d.Groups,
 		})
 	}
-	w.Header().Set("Location", "/v1/messages/"+msg.ID)
+	w.Header().Set("Location", "/v1/messages/"+result.MessageID)
 	s.writeJSON(w, http.StatusAccepted, resp)
 }
 
@@ -232,8 +244,11 @@ func (s *Server) buildMessage(req *createRequest) (*model.Message, *validationEr
 }
 
 type createResponse struct {
-	ID         string            `json:"id"`
-	Status     string            `json:"status"`
+	ID string `json:"id"`
+	// Status 是入队结果：queued（已排投递）/ deduped（命中去重）/ aggregated（进入聚合窗口）。
+	Status string `json:"status"`
+	// Merged 是同一 dedupe_key 被合并掉的次数，仅 deduped 时非零。
+	Merged     int               `json:"merged,omitempty"`
 	CreatedAt  time.Time         `json:"created_at"`
 	Route      *model.Route      `json:"route,omitempty"`
 	Deliveries []deliverySummary `json:"deliveries"`
@@ -291,10 +306,17 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 	if deliveries == nil {
 		deliveries = []*model.Delivery{}
 	}
+	aggregated, err := s.store.ListAggregatedMessages(r.Context(), id)
+	if err != nil {
+		s.log.Error("读取 digest 组成失败", "error", err, "message_id", id)
+		s.writeError(w, http.StatusInternalServerError, "internal_error", "读取 digest 组成失败", "")
+		return
+	}
 	s.writeJSON(w, http.StatusOK, getResponse{
-		Message:    msg,
-		Status:     aggregateStatus(deliveries),
-		Deliveries: deliveries,
+		Message:       msg,
+		Status:        aggregateStatus(msg, deliveries),
+		Deliveries:    deliveries,
+		AggregatedIDs: aggregated,
 	})
 }
 
@@ -302,10 +324,16 @@ type getResponse struct {
 	Message    *model.Message    `json:"message"`
 	Status     string            `json:"status"`
 	Deliveries []*model.Delivery `json:"deliveries"`
+	// AggregatedIDs 是这条 digest 汇总的原始消息 ID，仅 digest 非空。
+	AggregatedIDs []string `json:"aggregated_ids,omitempty"`
 }
 
-func aggregateStatus(deliveries []*model.Delivery) string {
+func aggregateStatus(msg *model.Message, deliveries []*model.Delivery) string {
 	if len(deliveries) == 0 {
+		if msg != nil && msg.AggregatedInto != "" {
+			// 已汇入 digest 的原始 info 消息，它自己不会再有投递记录。
+			return "aggregated"
+		}
 		return "queued"
 	}
 	var pending, succeeded, failed bool

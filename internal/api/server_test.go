@@ -20,10 +20,11 @@ import (
 const testToken = "good-token"
 
 type fakeStore struct {
-	msg        *model.Message
-	deliveries []*model.Delivery
-	getErr     error
-	pingErr    error
+	msg           *model.Message
+	deliveries    []*model.Delivery
+	aggregatedIDs []string
+	getErr        error
+	pingErr       error
 }
 
 func (f *fakeStore) GetMessage(ctx context.Context, id string) (*model.Message, error) {
@@ -40,6 +41,10 @@ func (f *fakeStore) ListDeliveries(ctx context.Context, messageID string) ([]*mo
 	return f.deliveries, nil
 }
 
+func (f *fakeStore) ListAggregatedMessages(ctx context.Context, digestID string) ([]string, error) {
+	return f.aggregatedIDs, nil
+}
+
 func (f *fakeStore) Ping(ctx context.Context) error { return f.pingErr }
 
 type fakeQueue struct {
@@ -54,7 +59,7 @@ func (f *fakeQueue) Channels() []string { return f.channels }
 
 func (f *fakeQueue) Groups() []string { return f.groups }
 
-func (f *fakeQueue) Enqueue(ctx context.Context, msg *model.Message) ([]*model.Delivery, error) {
+func (f *fakeQueue) Enqueue(ctx context.Context, msg *model.Message) (*model.EnqueueResult, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -74,7 +79,12 @@ func (f *fakeQueue) Enqueue(ctx context.Context, msg *model.Message) ([]*model.D
 			Status:  model.DeliveryPending,
 		})
 	}
-	return out, nil
+	return &model.EnqueueResult{
+		MessageID:  msg.ID,
+		Status:     model.EnqueueQueued,
+		Route:      msg.Route,
+		Deliveries: out,
+	}, nil
 }
 
 func (f *fakeQueue) lastEnqueued() *model.Message {
@@ -363,19 +373,21 @@ func TestGetMessageNotFound(t *testing.T) {
 func TestAggregateStatus(t *testing.T) {
 	cases := []struct {
 		name       string
+		msg        *model.Message
 		deliveries []*model.Delivery
 		want       string
 	}{
-		{"空", nil, "queued"},
-		{"排队中", []*model.Delivery{{Status: model.DeliveryPending}}, "in_progress"},
-		{"发送中", []*model.Delivery{{Status: model.DeliverySending}}, "in_progress"},
-		{"部分成功", []*model.Delivery{{Status: model.DeliverySucceeded}, {Status: model.DeliveryFailed}}, "partial"},
-		{"全部失败", []*model.Delivery{{Status: model.DeliveryFailed}, {Status: model.DeliveryFailed}}, "failed"},
-		{"全部成功", []*model.Delivery{{Status: model.DeliverySucceeded}, {Status: model.DeliverySucceeded}}, "succeeded"},
+		{"已汇入 digest", &model.Message{AggregatedInto: "msg_digest"}, nil, "aggregated"},
+		{"空", nil, nil, "queued"},
+		{"排队中", nil, []*model.Delivery{{Status: model.DeliveryPending}}, "in_progress"},
+		{"发送中", nil, []*model.Delivery{{Status: model.DeliverySending}}, "in_progress"},
+		{"部分成功", nil, []*model.Delivery{{Status: model.DeliverySucceeded}, {Status: model.DeliveryFailed}}, "partial"},
+		{"全部失败", nil, []*model.Delivery{{Status: model.DeliveryFailed}, {Status: model.DeliveryFailed}}, "failed"},
+		{"全部成功", nil, []*model.Delivery{{Status: model.DeliverySucceeded}, {Status: model.DeliverySucceeded}}, "succeeded"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := aggregateStatus(c.deliveries); got != c.want {
+			if got := aggregateStatus(c.msg, c.deliveries); got != c.want {
 				t.Errorf("aggregateStatus = %q, 期望 %q", got, c.want)
 			}
 		})

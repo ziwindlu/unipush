@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -16,12 +17,14 @@ import (
 
 // Config 是服务完整配置。
 type Config struct {
-	Server   Server         `yaml:"server"`
-	Auth     Auth           `yaml:"auth"`
-	Database Database       `yaml:"database"`
-	Dispatch Dispatch       `yaml:"dispatch"`
-	Channels Channels       `yaml:"channels"`
-	Routing  routing.Config `yaml:"routing"`
+	Server      Server         `yaml:"server"`
+	Auth        Auth           `yaml:"auth"`
+	Database    Database       `yaml:"database"`
+	Dispatch    Dispatch       `yaml:"dispatch"`
+	Channels    Channels       `yaml:"channels"`
+	Routing     routing.Config `yaml:"routing"`
+	Dedupe      Dedupe         `yaml:"dedupe"`
+	Aggregation Aggregation    `yaml:"aggregation"`
 
 	// Warnings 记录加载过程中被降级处理的配置（例如渠道凭据缺失）。
 	Warnings []string `yaml:"-"`
@@ -64,6 +67,74 @@ type Dispatch struct {
 type Channels struct {
 	Bark     Bark     `yaml:"bark"`
 	DingTalk DingTalk `yaml:"dingtalk"`
+	Feishu   Feishu   `yaml:"feishu"`
+	WeCom    WeCom    `yaml:"wecom"`
+	Email    Email    `yaml:"email"`
+	Webhook  Webhook  `yaml:"webhook"`
+}
+
+// Feishu 是飞书自定义机器人配置。
+type Feishu struct {
+	Enabled bool   `yaml:"enabled"`
+	Webhook string `yaml:"webhook"`
+	// Secret 是飞书机器人的加签密钥；为空表示未开启加签。
+	Secret string `yaml:"secret"`
+	// MsgType 是消息形态：text（默认）或 card（带标题的卡片）。
+	MsgType string `yaml:"msg_type"`
+}
+
+// WeCom 是企业微信群机器人配置。
+type WeCom struct {
+	Enabled bool   `yaml:"enabled"`
+	Webhook string `yaml:"webhook"`
+	// MsgType 是消息形态：markdown（默认）或 text。
+	MsgType string `yaml:"msg_type"`
+}
+
+// Email 是 SMTP 邮件渠道配置。
+type Email struct {
+	Enabled bool   `yaml:"enabled"`
+	Host    string `yaml:"host"`
+	Port    int    `yaml:"port"`
+	// Username / Password 只从环境变量注入，不入库。
+	Username string   `yaml:"username"`
+	Password string   `yaml:"password"`
+	From     string   `yaml:"from"`
+	To       []string `yaml:"to"`
+	// TLS 是加密方式：starttls（默认）/ ssl / none。
+	TLS           string `yaml:"tls"`
+	SubjectPrefix string `yaml:"subject_prefix"`
+}
+
+// Webhook 是通用 HTTP webhook 渠道配置。
+type Webhook struct {
+	Enabled bool   `yaml:"enabled"`
+	URL     string `yaml:"url"`
+	Method  string `yaml:"method"`
+	// Headers 是请求头；支持 ${ENV_VAR} 展开。
+	Headers map[string]string `yaml:"headers"`
+	// ContentType 默认 application/json; charset=utf-8。
+	ContentType string `yaml:"content_type"`
+	// BodyTemplate 是 Go text/template 模板，可用 {{.Title}} / {{.JSON}} 等字段；
+	// 留空时直接发送消息的 JSON 表示。
+	BodyTemplate string `yaml:"body_template"`
+}
+
+// Dedupe 是去重配置。
+type Dedupe struct {
+	// Enabled 关闭后 dedupe_key 只做记录，不再合并。
+	Enabled bool `yaml:"enabled"`
+	// Window 是去重时间窗：窗口内同一 dedupe_key 只投递一次。
+	Window time.Duration `yaml:"window"`
+}
+
+// Aggregation 是 info 级消息聚合配置。
+type Aggregation struct {
+	Enabled bool `yaml:"enabled"`
+	// Window 是聚合窗口：第一条消息进桶后等待这么久再发 digest。
+	Window time.Duration `yaml:"window"`
+	// MaxItems 是单个 digest 最多汇总多少条；到量立即发送。
+	MaxItems int `yaml:"max_items"`
 }
 
 // Bark 是 Bark 渠道配置。
@@ -108,7 +179,22 @@ func Default() *Config {
 		Channels: Channels{
 			Bark:     Bark{Enabled: true, ServerURL: "https://api.day.app", Group: "unipush"},
 			DingTalk: DingTalk{Enabled: true},
+			Feishu:   Feishu{Enabled: true, MsgType: "text"},
+			WeCom:    WeCom{Enabled: true, MsgType: "markdown"},
+			Email: Email{
+				Enabled:       true,
+				Port:          587,
+				TLS:           "starttls",
+				SubjectPrefix: "[unipush]",
+			},
+			Webhook: Webhook{
+				Enabled:     true,
+				Method:      http.MethodPost,
+				ContentType: "application/json; charset=utf-8",
+			},
 		},
+		Dedupe:      Dedupe{Enabled: true, Window: 5 * time.Minute},
+		Aggregation: Aggregation{Enabled: true, Window: time.Minute, MaxItems: 50},
 	}
 }
 
@@ -185,6 +271,58 @@ func (c *Config) normalize() {
 	c.Channels.DingTalk.Secret = strings.TrimSpace(c.Channels.DingTalk.Secret)
 	c.Channels.DingTalk.Keyword = strings.TrimSpace(c.Channels.DingTalk.Keyword)
 
+	c.Channels.Feishu.Webhook = strings.TrimSpace(c.Channels.Feishu.Webhook)
+	c.Channels.Feishu.Secret = strings.TrimSpace(c.Channels.Feishu.Secret)
+	c.Channels.Feishu.MsgType = strings.ToLower(strings.TrimSpace(c.Channels.Feishu.MsgType))
+	if c.Channels.Feishu.MsgType == "" {
+		c.Channels.Feishu.MsgType = "text"
+	}
+
+	c.Channels.WeCom.Webhook = strings.TrimSpace(c.Channels.WeCom.Webhook)
+	c.Channels.WeCom.MsgType = strings.ToLower(strings.TrimSpace(c.Channels.WeCom.MsgType))
+	if c.Channels.WeCom.MsgType == "" {
+		c.Channels.WeCom.MsgType = "markdown"
+	}
+
+	c.Channels.Email.Host = strings.TrimSpace(c.Channels.Email.Host)
+	c.Channels.Email.Username = strings.TrimSpace(c.Channels.Email.Username)
+	c.Channels.Email.Password = strings.TrimSpace(c.Channels.Email.Password)
+	c.Channels.Email.From = strings.TrimSpace(c.Channels.Email.From)
+	c.Channels.Email.SubjectPrefix = strings.TrimSpace(c.Channels.Email.SubjectPrefix)
+	c.Channels.Email.TLS = strings.ToLower(strings.TrimSpace(c.Channels.Email.TLS))
+	if c.Channels.Email.TLS == "" {
+		c.Channels.Email.TLS = "starttls"
+	}
+	if c.Channels.Email.Port == 0 {
+		c.Channels.Email.Port = 587
+	}
+	recipients := make([]string, 0, len(c.Channels.Email.To))
+	for _, to := range c.Channels.Email.To {
+		if to = strings.TrimSpace(to); to != "" {
+			recipients = append(recipients, to)
+		}
+	}
+	c.Channels.Email.To = recipients
+
+	c.Channels.Webhook.URL = strings.TrimSpace(c.Channels.Webhook.URL)
+	c.Channels.Webhook.Method = strings.ToUpper(strings.TrimSpace(c.Channels.Webhook.Method))
+	if c.Channels.Webhook.Method == "" {
+		c.Channels.Webhook.Method = http.MethodPost
+	}
+	c.Channels.Webhook.ContentType = strings.TrimSpace(c.Channels.Webhook.ContentType)
+	if c.Channels.Webhook.ContentType == "" {
+		c.Channels.Webhook.ContentType = "application/json; charset=utf-8"
+	}
+	if len(c.Channels.Webhook.Headers) > 0 {
+		headers := make(map[string]string, len(c.Channels.Webhook.Headers))
+		for k, v := range c.Channels.Webhook.Headers {
+			if k = strings.TrimSpace(k); k != "" {
+				headers[k] = strings.TrimSpace(v)
+			}
+		}
+		c.Channels.Webhook.Headers = headers
+	}
+
 	tokens := make([]string, 0, len(c.Auth.Tokens))
 	for _, t := range c.Auth.Tokens {
 		if t = strings.TrimSpace(t); t != "" {
@@ -209,7 +347,25 @@ func (c *Config) normalize() {
 		c.Channels.DingTalk.Enabled = false
 		c.Warnings = append(c.Warnings, "DINGTALK_WEBHOOK 未设置，dingtalk 渠道已禁用")
 	}
-	if !c.Channels.Bark.Enabled && !c.Channels.DingTalk.Enabled {
+	if c.Channels.Feishu.Enabled && c.Channels.Feishu.Webhook == "" {
+		c.Channels.Feishu.Enabled = false
+		c.Warnings = append(c.Warnings, "FEISHU_WEBHOOK 未设置，feishu 渠道已禁用")
+	}
+	if c.Channels.WeCom.Enabled && c.Channels.WeCom.Webhook == "" {
+		c.Channels.WeCom.Enabled = false
+		c.Warnings = append(c.Warnings, "WECOM_WEBHOOK 未设置，wecom 渠道已禁用")
+	}
+	if c.Channels.Email.Enabled && (c.Channels.Email.Host == "" || c.Channels.Email.From == "" || len(c.Channels.Email.To) == 0) {
+		c.Channels.Email.Enabled = false
+		c.Warnings = append(c.Warnings, "email 渠道缺少 host / from / to，已禁用")
+	}
+	if c.Channels.Webhook.Enabled && c.Channels.Webhook.URL == "" {
+		c.Channels.Webhook.Enabled = false
+		c.Warnings = append(c.Warnings, "WEBHOOK_URL 未设置，webhook 渠道已禁用")
+	}
+	if !c.Channels.Bark.Enabled && !c.Channels.DingTalk.Enabled &&
+		!c.Channels.Feishu.Enabled && !c.Channels.WeCom.Enabled &&
+		!c.Channels.Email.Enabled && !c.Channels.Webhook.Enabled {
 		c.Warnings = append(c.Warnings, "没有启用任何渠道：未指定 targets 的消息会被拒绝，直到配置好至少一个渠道")
 	}
 }
@@ -244,6 +400,35 @@ func (c *Config) validate() error {
 	}
 	if c.Server.MaxBodyBytes <= 0 {
 		return fmt.Errorf("server.max_body_bytes 必须大于 0")
+	}
+	switch c.Channels.Feishu.MsgType {
+	case "text", "card":
+	default:
+		return fmt.Errorf("channels.feishu.msg_type 只能是 text 或 card，当前是 %q", c.Channels.Feishu.MsgType)
+	}
+	switch c.Channels.WeCom.MsgType {
+	case "markdown", "text":
+	default:
+		return fmt.Errorf("channels.wecom.msg_type 只能是 markdown 或 text，当前是 %q", c.Channels.WeCom.MsgType)
+	}
+	switch c.Channels.Email.TLS {
+	case "starttls", "ssl", "none":
+	default:
+		return fmt.Errorf("channels.email.tls 只能是 starttls / ssl / none，当前是 %q", c.Channels.Email.TLS)
+	}
+	if c.Channels.Email.Port < 1 || c.Channels.Email.Port > 65535 {
+		return fmt.Errorf("channels.email.port 必须在 1-65535 之间")
+	}
+	if c.Dedupe.Enabled && c.Dedupe.Window <= 0 {
+		return fmt.Errorf("dedupe.window 必须大于 0")
+	}
+	if c.Aggregation.Enabled {
+		if c.Aggregation.Window <= 0 {
+			return fmt.Errorf("aggregation.window 必须大于 0")
+		}
+		if c.Aggregation.MaxItems < 1 {
+			return fmt.Errorf("aggregation.max_items 必须 >= 1")
+		}
 	}
 	return nil
 }
