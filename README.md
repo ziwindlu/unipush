@@ -10,7 +10,7 @@
 
 ## 状态
 
-M3 已完成：在 M1（单一入口 + Bearer 鉴权、Bark / 钉钉适配器、SQLite 落盘队列、指数退避重试、投递状态查询、优雅退出）与 M2（渠道组、按来源/级别的路由规则）之上补齐了**飞书 / 企业微信 / SMTP 邮件 / 通用 HTTP webhook**，并实现了**去重与聚合**——同一 `dedupe_key` 在窗口内只投递一次并累加合并次数，`info` 级消息按来源与投递目标攒成 digest 发送，`warn` / `error` 立即投递。Docker/CLI/部署文档（M4）在后续任务中实现。
+M1–M4 已全部落地：单一入口 + Bearer 鉴权、Bark / 钉钉 / 飞书 / 企业微信 / 邮件 / 通用 webhook 六个渠道、渠道组与按来源/级别的路由、SQLite 落盘队列与指数退避重试、去重与聚合，以及面向长期运行的 **`push` 命令行、只读消息列表、Docker、结构化日志和部署文档**。
 
 ## 快速开始
 
@@ -63,15 +63,39 @@ curl -sS -X POST http://127.0.0.1:8080/v1/messages \
 curl -sS http://127.0.0.1:8080/v1/messages/msg_... -H "Authorization: Bearer $UNIPUSH_AUTH_TOKEN"
 ```
 
-`status` 聚合为 `queued` / `in_progress` / `succeeded` / `partial` / `failed`；每条 delivery 带 `attempts`、`last_error`、`next_attempt_at`。
+`status` 聚合为 `queued` / `aggregated` / `in_progress` / `succeeded` / `partial` / `failed`；每条 delivery 带 `attempts`、`last_error`、`next_attempt_at`。
+
+## 用 CLI 发消息（脚本 / cron）
+
+```bash
+go build -o bin/push ./cmd/push
+
+./bin/push send \
+  --title "备份完成" \
+  --body "3 个文件，共 1.2 GB" \
+  --level info --source nas-monitor
+```
+
+`--url` / `--token` 不传时读 `UNIPUSH_URL` / `UNIPUSH_AUTH_TOKEN`，并自动加载当前目录的 `.env`，所以放在服务目录里直接就能用。`--body -` 从标准输入读正文，`--quiet` 只打印消息 ID，`--json` 打印原始响应；退出码 `0` / `1` / `2` 分别表示成功、请求失败、用法或配置错误。cron 写法见 [docs/deploy.md](docs/deploy.md#用-cli-发消息脚本--cron)。
+
+## Docker（可选）
+
+```bash
+cp .env.example .env       # 填 token 与渠道凭据
+docker compose up -d --build
+curl -fsS http://127.0.0.1:8080/healthz
+```
+
+容器只把端口映射到宿主机 `127.0.0.1:8080`，SQLite 落在宿主 `./data/unipush.db`（与直接跑二进制同一个路径），升级重启不丢队列。备份、升级、故障排查见 [docs/deploy.md](docs/deploy.md)。
 
 ## 接口
 
 | 方法 | 路径 | 鉴权 | 说明 |
 | --- | --- | --- | --- |
 | POST | `/v1/messages` | Bearer | 接收消息，归一化后落库并排队 |
+| GET | `/v1/messages` | Bearer | 只读消息列表：游标分页，按来源/级别/状态过滤 |
 | GET | `/v1/messages/{id}` | Bearer | 查询消息与每个渠道的投递状态 |
-| GET | `/healthz` | 无 | 健康检查（含数据库连通性） |
+| GET | `/healthz` | 无 | 健康检查：数据库、版本、运行时长、队列统计 |
 
 请求体字段：
 
@@ -124,9 +148,19 @@ WEBHOOK_URL=               # 通用 webhook 目标地址
 
 每个渠道的配置样例、签名/限流差异和实测 curl 命令见 [docs/channels.md](docs/channels.md)。
 
-常用配置项见 `config.yaml` 注释；数据库路径、worker 数量、重试次数、退避上下限、请求超时都可调。
+常用配置项见 `config.yaml` 注释；数据库路径、worker 数量、重试次数、退避上下限、请求超时、日志格式与级别都可调。`UNIPUSH_ADDR` / `UNIPUSH_DB_PATH` / `UNIPUSH_LOG_FORMAT` / `UNIPUSH_LOG_LEVEL` 可以覆盖配置文件，方便容器部署。
 
 `routing` 段定义渠道组与投递规则，是「消息发到哪」的唯一来源，完整说明见 [docs/routing.md](docs/routing.md)。
+
+## 部署
+
+- 本机常驻：macOS launchd、Linux systemd 单元示例，以及前台运行
+- Docker Compose：一条命令起服务，SQLite 挂载到宿主
+- 开启鉴权、多 token 配置、cron 调用示例
+- SQLite 备份 / 恢复（WAL 注意事项）、升级与回滚
+- 故障排查顺序与各渠道常见错误
+
+完整说明见 [docs/deploy.md](docs/deploy.md)。
 
 ## 测试
 
@@ -140,20 +174,25 @@ go test -race ./...
 - `internal/store`：落库、到期认领、租约、重启恢复、状态回写
 - `internal/routing`：按来源/级别命中规则、默认目标、显式 targets 覆盖、fan-out 去重、禁用渠道过滤，以及未知组 / 未知渠道 / 非法级别的启动校验
 - `internal/dispatch`：多渠道路由、按规则选渠道、显式覆盖、重试后成功、重试耗尽、永久失败、断网恢复、重启不重复发送；去重（同 key 连发 10 次只投 1 次、窗口过期后重投）与聚合（窗口到期 / 攒够条数才发 digest、error 不聚合、不同 targets 不混桶）
-- `internal/api`：401 / 400 / 413 / 503、字段归一化、查询聚合状态，以及两条端到端用例（同时打到 Bark + 钉钉；按来源路由 / 显式覆盖 / 查询路由结果）
+- `internal/api`：401 / 400 / 413 / 503、字段归一化、查询聚合状态、列表过滤与游标分页、健康检查字段，以及端到端用例（同时打到 Bark + 钉钉；按来源路由 / 显式覆盖 / 查询路由结果）
+- `internal/store`：消息列表的排序、来源/级别/状态过滤、keyset 分页与投递统计
+- `cmd/push`：CLI 参数校验、请求体、退出码、`--quiet` / `--json` / stdin 正文
 
 ## 目录
 
 ```
-cmd/unipush/        # 入口与优雅退出
+cmd/unipush/        # 服务入口与优雅退出
+cmd/push/           # 命令行客户端（脚本 / cron）
 internal/api/       # HTTP 接口与鉴权
 internal/channel/   # 渠道适配器契约与实现（bark/、dingtalk/、feishu/、wecom/、email/、webhook/）
 internal/config/    # YAML + .env 加载与校验
 internal/dispatch/  # 投递 worker、重试与退避
 internal/model/     # 消息、投递记录与路由结果模型
 internal/routing/   # 渠道组与投递规则的编译、校验与解析
-internal/store/     # SQLite（WAL）存取与迁移
-docs/               # 接口与路由说明
+internal/store/     # SQLite（WAL）存取、迁移与列表查询
+docs/               # 接口、路由、渠道与部署文档
+Dockerfile          # 多阶段构建，最终镜像只含二进制与配置
+docker-compose.yml  # 本机常驻样例（SQLite 挂载、健康检查、日志轮转）
 ```
 
 ## 里程碑
@@ -163,4 +202,4 @@ docs/               # 接口与路由说明
 | M1 | 消息入口、Bark/钉钉适配器、SQLite outbox、重试 | ✅ 已完成 |
 | M2 | 渠道组与按来源/级别的路由规则 | ✅ 已完成 |
 | M3 | 飞书/企微/邮件/Webhook、去重与聚合 | ✅ 已完成 |
-| M4 | Docker、CLI、只读消息列表、部署文档 | 待开始 |
+| M4 | Docker、CLI、只读消息列表、部署文档 | ✅ 已完成 |

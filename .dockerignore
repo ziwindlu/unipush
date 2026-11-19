@@ -1,0 +1,16 @@
+# 构建上下文只需要源码、依赖清单与 config.yaml。
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.db-wal
+*.db-shm
+bin/
+coverage.out
+docs/
+*.md
+Dockerfile
+docker-compose.yml

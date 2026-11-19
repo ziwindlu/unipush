@@ -149,3 +149,53 @@ func NormalizeTargets(targets []string) []string {
 	}
 	return out
 }
+
+// DeliveryCounts 是一条消息各状态投递记录的计数，用来汇总对外状态。
+type DeliveryCounts struct {
+	Total     int `json:"total"`
+	Pending   int `json:"pending"`
+	Succeeded int `json:"succeeded"`
+	Failed    int `json:"failed"`
+}
+
+// Add 把一条投递记录计入计数；sending 与 pending 都算未完成。
+func (c *DeliveryCounts) Add(status DeliveryStatus) {
+	c.Total++
+	switch status {
+	case DeliveryPending, DeliverySending:
+		c.Pending++
+	case DeliverySucceeded:
+		c.Succeeded++
+	case DeliveryFailed:
+		c.Failed++
+	}
+}
+
+// Status 把投递计数汇总成对外的消息状态：
+// queued / aggregated（还没有投递）/ in_progress / succeeded / partial / failed。
+func (c DeliveryCounts) Status(aggregated bool) string {
+	switch {
+	case c.Total == 0 && aggregated:
+		return "aggregated"
+	case c.Total == 0:
+		return "queued"
+	case c.Pending > 0:
+		return "in_progress"
+	case c.Succeeded > 0 && c.Failed > 0:
+		return "partial"
+	case c.Failed > 0:
+		return "failed"
+	default:
+		return "succeeded"
+	}
+}
+
+// ValidStatus 报告消息状态是否是可查询的取值（供 GET /v1/messages 过滤）。
+func ValidStatus(status string) bool {
+	switch status {
+	case "queued", "aggregated", "in_progress", "succeeded", "partial", "failed":
+		return true
+	default:
+		return false
+	}
+}

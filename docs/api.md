@@ -1,4 +1,4 @@
-# HTTP 接口说明（M1 + M2 路由 + M3 去重聚合）
+# HTTP 接口说明（M1 + M2 路由 + M3 去重聚合 + M4 列表）
 
 所有 `/v1/*` 接口要求 `Authorization: Bearer <token>`，token 来自 `UNIPUSH_AUTH_TOKEN`（可配置多个）。错误响应体统一为：
 
@@ -98,6 +98,60 @@ curl -sS -X POST http://127.0.0.1:8080/v1/messages \
 | 503 | 没有任何启用渠道；或命中的规则/组没有可用渠道（`no_route`，`error.message` 说明是哪条规则/哪个组） |
 | 500 | 落库失败等内部错误 |
 
+## GET /v1/messages
+
+只读消息列表，按创建时间倒序。支持过滤与游标分页，只查库、不触发重发。
+
+```bash
+# 最近 20 条
+curl -sS "http://127.0.0.1:8080/v1/messages" -H "Authorization: Bearer $UNIPUSH_AUTH_TOKEN"
+
+# 按来源 + 状态过滤，只看失败
+curl -sS "http://127.0.0.1:8080/v1/messages?source=nas-monitor&status=failed&limit=50" \
+  -H "Authorization: Bearer $UNIPUSH_AUTH_TOKEN"
+```
+
+查询参数：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `limit` | 20 | 每页条数，1–200 |
+| `cursor` | 无 | 上一页返回的 `next_cursor`，原样传回 |
+| `source` | 无 | 精确匹配来源，≤64 字符 |
+| `level` | 无 | `info` / `warn` / `error` |
+| `status` | 无 | `queued` / `aggregated` / `in_progress` / `succeeded` / `partial` / `failed`（与详情接口的聚合状态一致） |
+| `since` | 无 | 只返回该时间之后创建的消息，RFC3339，例如 `2026-01-01T00:00:00Z` |
+
+响应：
+
+```json
+{
+  "messages": [
+    {
+      "id": "msg_3f6f...",
+      "title": "磁盘告警",
+      "body": "剩余空间 3%",
+      "level": "error",
+      "source": "nas-monitor",
+      "route": {"mode": "rule", "rule": "nas-alerts", "groups": ["phone"], "channels": ["bark"]},
+      "merged_count": 0,
+      "created_at": "2026-01-01T08:00:00Z",
+      "status": "failed",
+      "deliveries": [
+        {"id": "dlv_...", "channel": "bark", "status": "failed", "attempts": 8,
+         "last_error": "bark: HTTP 401: device key 无效"}
+      ]
+    }
+  ],
+  "next_cursor": "MTc2NzI0NDgwMDAwMDptc2dfM2Y2Zg"
+}
+```
+
+- 每条消息平铺 `message` 的字段，另加聚合后的 `status` 和每渠道的投递摘要（`last_error` / `next_attempt_at` 便于直接判断卡在哪）。
+- `next_cursor` 只在还有下一页时出现；把它作为 `cursor` 传入即可翻页。没有更多数据时响应里没有该字段。
+- 空结果返回 `"messages": []`。
+- 400：`limit` / `level` / `status` / `since` / `cursor` 非法，`error.field` 指出是哪个参数。
+
 ## GET /v1/messages/{id}
 
 ```bash
@@ -190,10 +244,23 @@ digest 消息的响应里另有 `aggregated_ids`，列出被汇总的原始消�
 
 ## GET /healthz
 
-不需要鉴权，检查进程与 SQLite 连通性：
+不需要鉴权。检查数据库连通性，并顺带暴露版本、运行时长与队列积压：
 
 ```json
-{"status": "ok"}
+{
+  "status": "ok",
+  "version": "v1.0.0",
+  "uptime_seconds": 3600,
+  "checks": {"database": "ok"},
+  "queue": {"pending": 0, "sending": 1, "succeeded": 128, "failed": 2},
+  "channels": ["bark", "dingtalk"]
+}
 ```
 
-数据库不可用时返回 `503` 与 `{"status": "unavailable", "error": "..."}`。
+| 情况 | 状态码 | `status` |
+| --- | --- | --- |
+| 数据库正常 | 200 | `ok` |
+| 数据库不可用 | 503 | `unavailable`（`checks.database = unavailable`） |
+| 数据库正常但队列统计失败 | 200 | `degraded`（`checks.queue = unavailable`） |
+
+`queue` 里的积压不影响健康状态：消息还在重试，属于可恢复情况；持续上涨时按 [deploy.md](deploy.md#出问题先看什么) 排查。

@@ -1,0 +1,48 @@
+# 本机常驻：docker compose up -d
+#
+# 需要 Docker Compose v2.24+（下面的 env_file.required 让 .env 可选）。
+#
+# 首次使用：
+#   cp .env.example .env    # 填 UNIPUSH_AUTH_TOKEN 与各渠道凭据
+#   docker compose up -d --build
+#   curl -fsS http://127.0.0.1:8080/healthz
+#
+# 数据库落在宿主机 ./data/unipush.db（与 go run 时同一个路径），升级只换镜像、不换卷。
+services:
+  unipush:
+    build:
+      context: .
+      args:
+        VERSION: ${UNIPUSH_VERSION:-dev}
+    image: unipush:latest
+    container_name: unipush
+    restart: unless-stopped
+    # .env 可选：没有它服务也能启动（健康检查通过），但需要 token 与渠道凭据才能真正推送。
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      UNIPUSH_ADDR: 0.0.0.0:8080
+      UNIPUSH_DB_PATH: /data/unipush.db
+      UNIPUSH_LOG_FORMAT: json
+    # 只绑定宿主机回环地址，公网访问请自行加反向代理。
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data:/data
+      # 用仓库里的 config.yaml；想单独维护配置就换成 config.local.yaml 并取消注释下一行。
+      - ./config.yaml:/app/config.yaml:ro
+      # - ./config.local.yaml:/app/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    # 比 server.shutdown_timeout（10s）长，保证退出时把队列里的活干完。
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

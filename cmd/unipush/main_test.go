@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"os"
@@ -45,7 +47,8 @@ routing:
       sources: ["nas-*"]
       groups: [ghost]
 `)
-	err := serve(path, discardLogger())
+	cfg := mustLoad(t, path)
+	err := serve(cfg, discardLogger())
 	if err == nil {
 		t.Fatal("规则引用不存在的渠道组时，启动应直接失败")
 	}
@@ -71,7 +74,8 @@ routing:
     phone: [bark, telegram]
   default: [phone]
 `)
-	err := serve(path, discardLogger())
+	cfg := mustLoad(t, path)
+	err := serve(cfg, discardLogger())
 	if err == nil {
 		t.Fatal("组里引用未知渠道时，启动应直接失败")
 	}
@@ -80,6 +84,15 @@ routing:
 			t.Errorf("启动错误应包含 %q，实际: %s", want, err.Error())
 		}
 	}
+}
+
+func mustLoad(t *testing.T, path string) *config.Config {
+	t.Helper()
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	return cfg
 }
 
 func TestBuildRouterCompilesValidConfig(t *testing.T) {
@@ -153,5 +166,25 @@ func TestSampleConfigLoads(t *testing.T) {
 	// 样例里没有真实凭据，渠道会被自动禁用；路由仍应能编译（组里没有已启用渠道只是告警）。
 	if _, err := buildRouter(cfg, channel.Set{}); err != nil {
 		t.Fatalf("样例配置的路由编译失败: %v", err)
+	}
+}
+
+// TestNewLoggerJSONAndLevel 覆盖 M4：容器里用 json 日志，级别能过滤 debug。
+func TestNewLoggerJSONAndLevel(t *testing.T) {
+	var buf bytes.Buffer
+	logger := newLogger(&buf, "json", "warn")
+	logger.Info("不该出现")
+	logger.Warn("磁盘告警", "source", "nas-monitor")
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("warn 级别应只输出 1 行，实际 %d 行: %q", len(lines), buf.String())
+	}
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("json 日志不是合法 JSON: %v（%q）", err, lines[0])
+	}
+	if entry["level"] != "WARN" || entry["msg"] != "磁盘告警" || entry["source"] != "nas-monitor" {
+		t.Errorf("json 日志字段不对: %#v", entry)
 	}
 }

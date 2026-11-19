@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -49,24 +50,52 @@ func run() error {
 		return nil
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// 先用默认 logger 读配置，拿到 log.format / log.level 后再换成正式 logger。
+	logger := newLogger(os.Stdout, "text", "info")
 	slog.SetDefault(logger)
-	return serve(*configPath, logger)
-}
 
-// serve 加载配置、组装依赖并阻塞到收到退出信号。
-// 配置有误（例如路由引用了不存在的渠道组）会在开始监听之前返回错误。
-func serve(configPath string, logger *slog.Logger) error {
 	if n, err := config.LoadDotEnv(".env"); err != nil {
 		logger.Warn("加载 .env 失败", "error", err)
 	} else if n > 0 {
 		logger.Info("已从 .env 加载环境变量", "count", n)
 	}
 
-	cfg, err := config.Load(configPath)
+	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
 	}
+
+	logger = newLogger(os.Stdout, cfg.Log.Format, cfg.Log.Level)
+	slog.SetDefault(logger)
+	return serve(cfg, logger)
+}
+
+// newLogger 按配置创建结构化 logger：text 适合前台人读，json 适合容器日志采集。
+func newLogger(w io.Writer, format, level string) *slog.Logger {
+	var lvl slog.Level
+	switch level {
+	case "debug":
+		lvl = slog.LevelDebug
+	case "warn":
+		lvl = slog.LevelWarn
+	case "error":
+		lvl = slog.LevelError
+	default:
+		lvl = slog.LevelInfo
+	}
+	opts := &slog.HandlerOptions{Level: lvl}
+	var handler slog.Handler
+	if format == "json" {
+		handler = slog.NewJSONHandler(w, opts)
+	} else {
+		handler = slog.NewTextHandler(w, opts)
+	}
+	return slog.New(handler)
+}
+
+// serve 按已加载的配置组装依赖，并阻塞到收到退出信号。
+// 配置有误（例如路由引用了不存在的渠道组）会在开始监听之前返回错误。
+func serve(cfg *config.Config, logger *slog.Logger) error {
 	for _, warning := range cfg.Warnings {
 		logger.Warn(warning)
 	}
@@ -118,6 +147,7 @@ func serve(configPath string, logger *slog.Logger) error {
 	apiServer := api.New(api.Config{
 		AuthTokens:   cfg.Auth.Tokens,
 		MaxBodyBytes: cfg.Server.MaxBodyBytes,
+		Version:      version,
 	}, st, dispatcher, logger)
 
 	httpServer := &http.Server{
@@ -151,6 +181,8 @@ func serve(configPath string, logger *slog.Logger) error {
 		"database", cfg.Database.Path,
 		"channels", dispatcher.Channels(),
 		"groups", dispatcher.Groups(),
+		"log_format", cfg.Log.Format,
+		"log_level", cfg.Log.Level,
 	)
 
 	select {
